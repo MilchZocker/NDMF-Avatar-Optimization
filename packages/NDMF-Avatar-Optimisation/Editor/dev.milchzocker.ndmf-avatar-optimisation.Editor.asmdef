@@ -1,0 +1,25 @@
+{
+  "name": "dev.milchzocker.ndmf-avatar-optimisation.Editor",
+  "rootNamespace": "MilchZocker.AvatarOptimizer",
+  "references": [
+    "dev.milchzocker.ndmf-avatar-optimisation.Runtime",
+    "nadena.dev.ndmf"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [
+    {
+      "name": "nadena.dev.ndmf",
+      "expression": "1.5.0",
+      "define": "NDMF_1_5_0_OR_NEWER"
+    }
+  ],
+  "noEngineReferences": false
+}

@@ -1,0 +1,19 @@
+{
+  "name": "dev.milchzocker.ndmf-avatar-optimisation",
+  "displayName": "NDMF Avatar Optimisation",
+  "version": "1.0.0",
+  "unity": "2021.3",
+  "description": "NDMF-based Avatar optimisation tailored to ChilloutVR",
+  "author": {
+    "name": "MilchZocker",
+    "url": "https://github.com/MilchZocker"
+  },
+  "dependencies": {
+    "nadena.dev.ndmf": "1.5.0"
+  },
+  "vpmDependencies": {
+    "dev.hai-vr.chillaxins": "1.1.0"
+  },
+  "url": "https://github.com/MilchZocker/NDMF-Avatar-Optimisation",
+  "licensesUrl": "https://github.com/MilchZocker/NDMF-Avatar-Optimisation/blob/main/LICENSE.md"
+}
