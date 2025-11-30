@@ -7,12 +7,6 @@ NDMF-Avatar-Optimization streamlines the process of preparing avatars for deploy
 - **Speed:** Automate compression and validation so artists and developers can focus on content instead of tooling.
 - **Quality control:** Catch common avatar issues early, reducing rework before integration.
 
-## Quickstart
-1. **Install dependencies:** Ensure Node.js and npm (or pnpm) are available.
-2. **Install packages:** From the repo root, run `npm install` (or `pnpm install`).
-3. **Optimize avatars:** Run `npm run optimize -- <input_folder> <output_folder>` to process your avatar assets.
-4. **Review output:** Check the generated files and logs in the output folder for any warnings or suggested fixes.
-
 ## Best results with NDMF-Merge
 For large projects, pair this tool with **NDMF-Merge** to manage branches and asset updates efficiently:
 - Run NDMF-Merge to pull or merge the latest asset changes into your workspace.
