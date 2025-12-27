@@ -150,6 +150,27 @@ namespace MilchZocker.AvatarOptimizer
             
             [Tooltip("Exclude meshes with name patterns (comma-separated)")]
             public string meshNameExclude = "";
+            
+            [Space(10)]
+            [Tooltip("Strip unused mesh data (tangents, vertex colors, lightmap UVs)")]
+            public bool stripUnusedMeshData = true;
+            
+            [Tooltip("Deduplicate identical materials to reduce draw calls")]
+            public bool deduplicateMaterials = true;
+
+            [Space(10)]
+            [Header("Advanced Mesh Optimizations")]
+            [Tooltip("Optimize index buffer for GPU vertex cache and reorder vertices where supported")]
+            public bool optimizeIndexBuffer = false;
+
+            [Tooltip("Merge identical submeshes that use the same material to reduce draw calls")]
+            public bool mergeIdenticalSubmeshes = false;
+
+            [Tooltip("Intelligently strip vertex attributes based on shader usage (tangents, colors, uv2/3/4)")]
+            public bool intelligentAttributeStripping = false;
+
+            [Tooltip("Log detailed information about mesh-level optimizations")]
+            public bool verboseLogging = false;
         }
         
         [Serializable]
@@ -219,10 +240,9 @@ namespace MilchZocker.AvatarOptimizer
             [Space(10)]
             [Header("Atlas Generation Mode")]
             [Tooltip("Use enhanced atlas workflow with better grouping and optimization")]
-            [FormerlySerializedAs("useXatlas")]
             public bool useEnhancedAtlasWorkflow = false;
             
-            [Tooltip("Merge materials using same textures by adjusting UV padding (experimental)")]
+            [Tooltip("Merge materials using same textures by adjusting UV/padding (experimental)")]
             public bool mergeIdenticalTextures = false;
             
             [Space(10)]
@@ -242,6 +262,11 @@ namespace MilchZocker.AvatarOptimizer
             [Tooltip("Padding between textures in atlas (pixels)")]
             [Range(0, 16)]
             public int atlasPadding = 2;
+            
+            [Space(10)]
+            [Tooltip("Minimum output size for atlas textures. Set to 0 to use texture-derived sizes only. Higher values produce better quality but larger file sizes.")]
+            [Range(0, 2048)]
+            public int minimumOutputAtlasSize = 512;
             
             [Space(10)]
             [Header("Advanced Settings")]
@@ -268,6 +293,184 @@ namespace MilchZocker.AvatarOptimizer
             public string excludedShaderNames = "Hidden,UI,Unlit/Transparent";
             
             [Space(10)]
+            [Header("═══════ Adaptive Compression Configuration ═══════")]
+            [Tooltip("Enable adaptive compression based on texture complexity analysis")]
+            public bool useAdaptiveCompression = true;
+            
+            [Tooltip("Log detailed complexity analysis for each texture")]
+            public bool verboseDensityLogging = false;
+            
+            [Space(5)]
+            [Tooltip("Define custom complexity score ranges and their compression settings")]
+            public List<CompressionTier> compressionTiers = new List<CompressionTier>
+            {
+                new CompressionTier { tierName = "Ultra Low (Solid Colors)", minComplexity = 0.00f, maxComplexity = 0.10f, maxTextureSize = 256, crunchQuality = 40, enableTier = true },
+                new CompressionTier { tierName = "Very Low (Simple Masks)", minComplexity = 0.10f, maxComplexity = 0.20f, maxTextureSize = 512, crunchQuality = 50, enableTier = true },
+                new CompressionTier { tierName = "Low (Basic Patterns)", minComplexity = 0.20f, maxComplexity = 0.35f, maxTextureSize = 1024, crunchQuality = 60, enableTier = true },
+                new CompressionTier { tierName = "Medium (Moderate Detail)", minComplexity = 0.35f, maxComplexity = 0.55f, maxTextureSize = 2048, crunchQuality = 75, enableTier = true },
+                new CompressionTier { tierName = "High (Detailed Textures)", minComplexity = 0.55f, maxComplexity = 0.75f, maxTextureSize = 4096, crunchQuality = 85, enableTier = true },
+                new CompressionTier { tierName = "Very High (Complex/Text)", minComplexity = 0.75f, maxComplexity = 0.90f, maxTextureSize = 4096, crunchQuality = 92, enableTier = true },
+                new CompressionTier { tierName = "Ultra High (Critical Detail)", minComplexity = 0.90f, maxComplexity = 1.00f, maxTextureSize = 8192, crunchQuality = 100, enableTier = true }
+            };
+            
+            [Space(5)]
+            [Header("Complexity Analysis Weights")]
+            [Tooltip("Weight for color diversity in complexity calculation (0-1)")]
+            [Range(0f, 1f)]
+            public float colorDiversityWeight = 0.30f;
+            
+            [Tooltip("Weight for color variance in complexity calculation (0-1)")]
+            [Range(0f, 1f)]
+            public float colorVarianceWeight = 0.30f;
+            
+            [Tooltip("Weight for edge density in complexity calculation (0-1)")]
+            [Range(0f, 1f)]
+            public float edgeDensityWeight = 0.40f;
+            
+            [Tooltip("Edge detection threshold (0-1, lower = more sensitive)")]
+            [Range(0.01f, 0.5f)]
+            public float edgeDetectionThreshold = 0.1f;
+            
+            [Space(5)]
+            [Header("Property-Specific Complexity Modifiers")]
+            [Tooltip("Add complexity boost for main/albedo textures")]
+            [Range(-0.5f, 0.5f)]
+            public float mainTextureComplexityBoost = 0.15f;
+            
+            [Tooltip("Add complexity boost for normal maps")]
+            [Range(-0.5f, 0.5f)]
+            public float normalMapComplexityBoost = 0.10f;
+            
+            [Tooltip("Add complexity boost for detail textures")]
+            [Range(-0.5f, 0.5f)]
+            public float detailTextureComplexityBoost = 0.15f;
+            
+            [Tooltip("Reduce complexity for mask textures")]
+            [Range(-0.5f, 0.5f)]
+            public float maskTextureComplexityReduction = -0.10f;
+            
+            [Tooltip("Reduce complexity for emission textures")]
+            [Range(-0.5f, 0.5f)]
+            public float emissionTextureComplexityBoost = 0.05f;
+            
+            [Space(10)]
+            [Header("═══════ Texture Cache & Deduplication ═══════")]
+            [Tooltip("Use texture fingerprinting to avoid processing duplicates")]
+            public bool enableTextureCaching = true;
+            
+            [Tooltip("Deduplicate identical textures across materials before atlasing")]
+            public bool deduplicateBeforeAtlas = true;
+            
+            [Tooltip("Cache processed textures for faster re-builds")]
+            public bool persistTextureCache = false;
+            
+            [Space(10)]
+            [Header("═══════ Per-Property Atlas Control ═══════")]
+            [Tooltip("Allow different atlas sizes per texture property (e.g., larger for albedo, smaller for masks)")]
+            public bool enablePerPropertySizing = false;
+            
+            [Tooltip("Property-specific atlas size overrides (format: PropertyName:Size, e.g., _MainTex:4096,_Mask:1024)")]
+            public string perPropertyAtlasSizes = "";
+            
+            [Tooltip("Force specific properties to always share the same atlas size")]
+            public string linkedAtlasProperties = "_MainTex,_BumpMap,_MetallicGlossMap";
+            
+            [Space(5)]
+            [Tooltip("Property-specific crunch quality overrides (format: PropertyName:Quality, e.g., _MainTex:95,_Mask:50)")]
+            public string perPropertyCrunchQuality = "";
+            
+            [Tooltip("Force specific properties to use uncompressed format (comma-separated)")]
+            public string uncompressedProperties = "";
+            
+            [Space(10)]
+            [Header("═══════ Atlas Naming & Organization ═══════")]
+            [Tooltip("Prefix for generated atlas textures")]
+            public string atlasNamePrefix = "Atlas_";
+            
+            [Tooltip("Include shader name in atlas filename")]
+            public bool includeShaderInName = true;
+            
+            [Tooltip("Include property name in atlas filename")]
+            public bool includePropertyInName = true;
+            
+            [Tooltip("Add timestamp to atlas names (prevents asset conflicts)")]
+            public bool addTimestampToName = false;
+            
+            [Tooltip("Add complexity tier to atlas filename")]
+            public bool includeTierInName = false;
+            
+            [Space(10)]
+            [Header("═══════ Safety & Validation ═══════")]
+            [Tooltip("Validate UV coordinates are within bounds before atlasing")]
+            public bool validateUVBounds = true;
+            
+            [Tooltip("Warn if UV coordinates extend outside 0-1 range")]
+            public bool warnOnInvalidUVs = true;
+            
+            [Tooltip("Automatically fix out-of-bounds UVs by wrapping/clamping")]
+            public bool autoFixInvalidUVs = false;
+            
+            [Tooltip("Skip materials with invalid UVs instead of fixing them")]
+            public bool skipInvalidUVMaterials = false;
+            
+            [Space(5)]
+            [Tooltip("Maximum number of materials to combine in a single atlas")]
+            [Range(2, 100)]
+            public int maxMaterialsPerAtlas = 50;
+            
+            [Tooltip("Skip atlasing if estimated atlas would exceed this pixel count")]
+            public bool limitAtlasPixelCount = true;
+            
+            [Tooltip("Maximum total pixels in an atlas (width * height)")]
+            public int maxAtlasPixels = 67108864;
+            
+            [Space(10)]
+            [Header("═══════ Mip & Atlas Robustness ═══════")]
+            [Tooltip("Use mip-aware padding to pick padding that is safe for mipmaps")]
+            public bool useMipAwarePadding = true;
+            
+            [Tooltip("Attempt to reduce fragmentation by iteratively repacking atlases")]
+            public bool optimizeFragmentation = true;
+            
+            [Tooltip("Target minimum utilization before attempting size reduction (0.0-1.0)")]
+            [Range(0.5f, 0.95f)]
+            public float targetUtilization = 0.85f;
+            
+            [Tooltip("Apply seam padding to atlases to avoid edge bleeding across UVs")]
+            public bool padUVSeams = true;
+            
+            [Tooltip("Special handling for normal maps (ensures tangent space format)")]
+            public bool preserveNormalMaps = true;
+            
+            [Tooltip("Detect and handle sRGB vs Linear color space automatically")]
+            public bool autoDetectColorSpace = true;
+            
+            [Space(5)]
+            [Tooltip("Apply texture filtering optimization based on content type")]
+            public bool optimizeFilterModes = true;
+            
+            [Tooltip("Filter mode for high-detail textures (albedo, normal)")]
+            public FilterMode detailTextureFilter = FilterMode.Trilinear;
+            
+            [Tooltip("Filter mode for low-detail textures (masks, simple patterns)")]
+            public FilterMode simpleTextureFilter = FilterMode.Bilinear;
+            
+            [Space(5)]
+            [Tooltip("Generate mipmaps for atlas textures")]
+            public bool generateMipmaps = true;
+            
+            [Tooltip("Mipmap filter for better quality at distance")]
+            public MipmapFilterMode mipmapFilter = MipmapFilterMode.Box;
+            
+            [Tooltip("Fade out mips to gray (helps with texture shimmer)")]
+            public bool fadeOutMipmaps = false;
+            
+            [Range(0, 10)]
+            [Tooltip("Mip level to start fade (0 = start immediately)")]
+            public int mipmapFadeStart = 0;
+            
+            [Space(10)]
+            [Header("═══════ Atlas Compression ═══════")]
             [Tooltip("Compress generated atlases")]
             public bool compressAtlases = true;
             
@@ -280,13 +483,135 @@ namespace MilchZocker.AvatarOptimizer
                 DXT1,
                 DXT5,
                 BC7,
-                ASTC,
+                ASTC_4x4,
+                ASTC_6x6,
+                ASTC_8x8,
+                ETC2_RGB,
+                ETC2_RGBA,
                 Uncompressed
             }
+            
+            [Space(5)]
+            [Tooltip("Apply platform-specific compression overrides")]
+            public bool usePlatformSpecificCompression = false;
+            
+#if UNITY_EDITOR
+            [Tooltip("Standalone platform compression format")]
+            public UnityEditor.TextureImporterFormat standaloneFormat = UnityEditor.TextureImporterFormat.DXT5;
+            
+            [Tooltip("Android platform compression format")]
+            public UnityEditor.TextureImporterFormat androidFormat = UnityEditor.TextureImporterFormat.ASTC_6x6;
+            
+            [Tooltip("iOS platform compression format")]
+            public UnityEditor.TextureImporterFormat iosFormat = UnityEditor.TextureImporterFormat.ASTC_6x6;
+#else
+            [HideInInspector]
+            public int standaloneFormat = 0;
+            
+            [HideInInspector]
+            public int androidFormat = 0;
+            
+            [HideInInspector]
+            public int iosFormat = 0;
+#endif
+            
+            [Space(10)]
+            [Header("═══════ Advanced Quality Settings ═══════")]
+            [Tooltip("Downscale textures that are significantly larger than others in the same atlas")]
+            public bool normalizeTextureSizes = false;
+            
+            [Tooltip("Maximum size ratio between largest and smallest texture (2 = 2x difference allowed)")]
+            [Range(1f, 8f)]
+            public float maxTextureSizeRatio = 4f;
+            
+            [Space(5)]
+            [Tooltip("Apply sharpening filter to downscaled textures")]
+            public bool sharpenDownscaledTextures = false;
+            
+            [Tooltip("Sharpening strength (0-1)")]
+            [Range(0f, 1f)]
+            public float sharpeningStrength = 0.3f;
+            
+            [Space(5)]
+            [Tooltip("Attempt to pack smaller textures more tightly")]
+            public bool useAdvancedPacking = false;
+            
+            [Tooltip("Allow texture rotation for better packing (experimental, may affect UVs)")]
+            public bool allowTextureRotation = false;
             
             [Space(10)]
             [Tooltip("Log detailed information about atlas generation and exclusions")]
             public bool verboseLogging = false;
+        }
+
+        [Serializable]
+        public class CompressionTier
+        {
+            [Tooltip("Name/description for this compression tier")]
+            public string tierName = "Unnamed Tier";
+            
+            [Tooltip("Minimum complexity score for this tier (0.0-1.0)")]
+            [Range(0f, 1f)]
+            public float minComplexity = 0f;
+            
+            [Tooltip("Maximum complexity score for this tier (0.0-1.0)")]
+            [Range(0f, 1f)]
+            public float maxComplexity = 1f;
+            
+            [Tooltip("Maximum texture size for this tier")]
+            public int maxTextureSize = 2048;
+            
+            [Tooltip("Crunch compression quality (0-100, higher = better quality)")]
+            [Range(0, 100)]
+            public int crunchQuality = 75;
+            
+            [Tooltip("Enable this compression tier")]
+            public bool enableTier = true;
+            
+            [Space(5)]
+            [Header("Advanced Tier Settings")]
+            [Tooltip("Force specific compression format (overrides automatic)")]
+            public bool useCustomFormat = false;
+            
+#if UNITY_EDITOR
+            [Tooltip("Custom compression format")]
+            public UnityEditor.TextureImporterFormat customFormat = UnityEditor.TextureImporterFormat.Automatic;
+#else
+            [HideInInspector]
+            public int customFormat = 0;
+#endif
+            
+            [Tooltip("Anisotropic filtering level (0 = disabled, 16 = max)")]
+            [Range(0, 16)]
+            public int anisoLevel = 1;
+            
+            [Tooltip("Override filter mode for this tier")]
+            public bool overrideFilterMode = false;
+            
+            [Tooltip("Custom filter mode")]
+            public FilterMode filterMode = FilterMode.Bilinear;
+            
+            [Tooltip("Force generate mipmaps regardless of global setting")]
+            public bool forceGenerateMipmaps = false;
+            
+            [Tooltip("Disable mipmaps for this tier")]
+            public bool disableMipmaps = false;
+            
+            [Space(5)]
+            [Tooltip("Property name filters (comma-separated, only apply tier to matching properties, empty = all)")]
+            public string propertyNameFilter = "";
+            
+            [Tooltip("Exclude properties matching these patterns (comma-separated)")]
+            public string propertyNameExclude = "";
+            
+            [HideInInspector]
+            public string _notes = "";
+        }
+
+        public enum MipmapFilterMode
+        {
+            Box,
+            Kaiser
         }
     }
 }

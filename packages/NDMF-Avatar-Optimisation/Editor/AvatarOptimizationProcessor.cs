@@ -1,6 +1,7 @@
 #if UNITY_EDITOR
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -23,6 +24,23 @@ namespace MilchZocker.AvatarOptimizer
         private readonly Dictionary<SkinnedMeshRenderer, Mesh> optimizedMeshes = new Dictionary<SkinnedMeshRenderer, Mesh>();
         private readonly Dictionary<Material, Material> materialCopies = new Dictionary<Material, Material>();
         private readonly Dictionary<Transform, HashSet<string>> animatedTransformProperties = new Dictionary<Transform, HashSet<string>>();
+
+        // Pending atlas import settings (for atlases that haven't been saved to AssetDatabase yet)
+        private readonly Dictionary<Texture2D, TextureDensityAnalysis> atlasImportSettings = new Dictionary<Texture2D, TextureDensityAnalysis>();
+
+        // Texture caching and deduplication
+        private readonly Dictionary<string, Texture2D> textureCache = new Dictionary<string, Texture2D>();
+        private readonly Dictionary<Texture2D, string> textureFingerprintCache = new Dictionary<Texture2D, string>();
+
+        // Memory estimation struct
+        public struct MemoryEstimate
+        {
+            public long currentBytes;
+            public long optimizedBytes;
+            public float savingsPercent;
+            public int meshCount;
+            public int textureCount;
+        }
 
         private Type cvrAvatarType;
         private Type cvrFaceTrackingType;
@@ -149,11 +167,27 @@ namespace MilchZocker.AvatarOptimizer
                     PopLogIndent();
                 }
 
+                if (optimizer.meshSettings.stripUnusedMeshData)
+                {
+                    LogBuffered("[AvatarOptimizer] Strip unused mesh data ON");
+                    PushLogIndent();
+                    StripUnusedMeshData();
+                    PopLogIndent();
+                }
+
                 if (optimizer.meshSettings.combineMeshes)
                 {
                     LogBuffered("[AvatarOptimizer] Combine meshes ON");
                     PushLogIndent();
                     CombineMeshes();
+                    PopLogIndent();
+                }
+
+                if (optimizer.meshSettings.deduplicateMaterials)
+                {
+                    LogBuffered("[AvatarOptimizer] Deduplicate materials ON");
+                    PushLogIndent();
+                    DeduplicateMaterials();
                     PopLogIndent();
                 }
 
@@ -173,6 +207,9 @@ namespace MilchZocker.AvatarOptimizer
             finally
             {
                 optimizer.stats.optimizationTimeSeconds = Time.realtimeSinceStartup - startTime;
+
+                // Try to apply any pending atlas import settings whose atlases are now saved to the AssetDatabase
+                ApplyPendingAtlasImportSettings();
 
                 LogBuffered($"[AvatarOptimizer] ========== Optimization Complete in {optimizer.stats.optimizationTimeSeconds:F2}s ==========");
                 LogBuffered($"[AvatarOptimizer] Stats: {optimizer.stats.bonesRemoved} bones, {optimizer.stats.boneReferencesRemoved} bone refs, " +
@@ -240,6 +277,95 @@ namespace MilchZocker.AvatarOptimizer
             copy.name = original.name + "_Atlased";
             materialCopies[original] = copy;
             return copy;
+        }
+
+        #endregion
+
+        #region Mesh Utilities
+
+        private void StripUnusedMeshData()
+        {
+            LogBuffered("[AvatarOptimizer] Stripping unused mesh data...");
+            PushLogIndent();
+            int strippedCount = 0;
+
+            foreach (var smr in context.AvatarRootTransform.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                var mesh = GetOrCreateMeshCopy(smr, "_Stripped");
+                if (mesh == null) continue;
+
+                bool modified = false;
+
+                if (mesh.tangents != null && mesh.tangents.Length > 0)
+                {
+                    mesh.tangents = null;
+                    modified = true;
+                }
+
+                if (mesh.colors != null && mesh.colors.Length > 0)
+                {
+                    mesh.colors = null;
+                    modified = true;
+                }
+
+                // UV2 / lightmap UVs (older Unity versions may throw; ignore exceptions)
+                try
+                {
+                    var uv2 = mesh.uv2;
+                    if (uv2 != null && uv2.Length > 0)
+                    {
+                        mesh.uv2 = null;
+                        modified = true;
+                    }
+                }
+                catch { }
+
+                if (modified) strippedCount++;
+            }
+
+            LogBuffered($"[AvatarOptimizer] Stripped mesh data from {strippedCount} meshes");
+            PopLogIndent();
+        }
+
+        private void DeduplicateMaterials()
+        {
+            LogBuffered("[AvatarOptimizer] Deduplicating materials...");
+            PushLogIndent();
+            int deduped = 0;
+
+            var materialMap = new Dictionary<string, Material>();
+
+            foreach (var renderer in context.AvatarRootTransform.GetComponentsInChildren<Renderer>(true))
+            {
+                var mats = renderer.sharedMaterials;
+                bool changed = false;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    var m = mats[i];
+                    if (m == null) continue;
+                    string key = $"{m.shader.name}|{m.mainTexture?.GetInstanceID() ?? 0}|{m.name}";
+                    if (materialMap.TryGetValue(key, out var existing))
+                    {
+                        if (!ReferenceEquals(existing, m))
+                        {
+                            mats[i] = existing;
+                            deduped++;
+                            changed = true;
+                        }
+                    }
+                    else
+                    {
+                        materialMap[key] = m;
+                    }
+                }
+                if (changed)
+                {
+                    renderer.sharedMaterials = mats;
+                }
+            }
+
+            LogBuffered($"[AvatarOptimizer] Deduplicated {deduped} material slots");
+            PopLogIndent();
         }
 
         #endregion
@@ -1194,6 +1320,15 @@ namespace MilchZocker.AvatarOptimizer
                 if (modified && !hasSkinnedData)
                 {
                     mesh.RecalculateBounds();
+
+                    if (optimizer.meshSettings.optimizeIndexBuffer)
+                        OptimizeIndexBuffer(mesh);
+
+                    if (optimizer.meshSettings.mergeIdenticalSubmeshes)
+                        MergeIdenticalSubmeshes(mesh, smr.sharedMaterials);
+
+                    if (optimizer.meshSettings.intelligentAttributeStripping)
+                        StripUnusedVertexAttributesIntelligent(mesh, smr.sharedMaterials);
                 }
             }
 
@@ -1963,10 +2098,18 @@ namespace MilchZocker.AvatarOptimizer
             return groups;
         }
 
+        /// <summary>
+        /// Check if property is a normal/bump map
+        /// </summary>
         private bool IsNormalProperty(string propName)
         {
-            return propName.IndexOf("bump", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   propName.IndexOf("normal", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (string.IsNullOrEmpty(propName))
+                return false;
+                
+            string lower = propName.ToLower();
+            return lower.Contains("normal") || 
+                   lower.Contains("bump") || 
+                   lower == "_bumpmap";
         }
         // -------------------------------------------------------------
 
@@ -2009,31 +2152,56 @@ namespace MilchZocker.AvatarOptimizer
             // Build textures only for representative properties
             var texturesByRepProp = new Dictionary<string, Texture2D[]>();
 
+            // Collect textures for each representative property WITH linked scaling
             foreach (var repProp in representativeProps)
             {
                 var list = new List<Texture2D>(mats.Count);
+
+                // First pass: determine the maximum dimensions for this property across all materials
+                int maxWidth = optimizer.atlasSettings.minimumTextureSize;
+                int maxHeight = optimizer.atlasSettings.minimumTextureSize;
+
+                foreach (var mat in mats)
+                {
+                    if (mat.HasProperty(repProp))
+                    {
+                        var tex = mat.GetTexture(repProp) as Texture2D;
+                        if (tex != null)
+                        {
+                            maxWidth = Mathf.Max(maxWidth, tex.width);
+                            maxHeight = Mathf.Max(maxHeight, tex.height);
+                        }
+                    }
+                }
+
+                // Apply minimum output atlas size if configured
+                if (optimizer.atlasSettings.minimumOutputAtlasSize > 0)
+                {
+                    maxWidth = Mathf.Max(maxWidth, optimizer.atlasSettings.minimumOutputAtlasSize);
+                    maxHeight = Mathf.Max(maxHeight, optimizer.atlasSettings.minimumOutputAtlasSize);
+                }
+
+                // Second pass: create textures using the linked maximum dimensions
                 foreach (var mat in mats)
                 {
                     Texture2D tex = null;
                     if (mat.HasProperty(repProp))
+                    {
                         tex = mat.GetTexture(repProp) as Texture2D;
+                    }
 
                     if (tex == null)
                     {
-                        Vector2Int ps = enhanced
-                            ? new Vector2Int(optimizer.atlasSettings.minimumTextureSize, optimizer.atlasSettings.minimumTextureSize)
-                            : refSizes[mat];
-                        tex = CreatePlaceholderTexture(repProp, ps.x, ps.y);
-                    }
-
-                    if (!enhanced)
-                    {
-                        var rs = refSizes[mat];
-                        tex = EnsureSizeReadable(tex, rs.x, rs.y);
+                        // Create placeholder at linked scale dimensions
+                        tex = CreatePlaceholderTexture(repProp, maxWidth, maxHeight);
                     }
                     else
                     {
-                        tex = EnsureReadable(tex);
+                        // Ensure readable and scale to match linked dimensions (use cache & normals handling)
+                        if (optimizer.atlasSettings.preserveNormalMaps && IsNormalProperty(repProp))
+                            tex = GetCachedTexture(tex, t => EnsureReadableNormal(EnsureSizeReadable(EnsureReadable(t), maxWidth, maxHeight)));
+                        else
+                            tex = GetCachedTexture(tex, t => EnsureSizeReadable(EnsureReadable(t), maxWidth, maxHeight));
                     }
 
                     list.Add(tex);
@@ -2046,10 +2214,12 @@ namespace MilchZocker.AvatarOptimizer
             string driverProp = representativeProps[0];
             var driverTextures = texturesByRepProp[driverProp];
 
+            int optimalPadding = optimizer.atlasSettings.useMipAwarePadding ? CalculateOptimalPadding((int)optimizer.atlasSettings.maxAtlasSize) : optimizer.atlasSettings.atlasPadding;
+
             var driverRes = ManagedAtlasPacker.PackTextures(
                 driverTextures,
                 (int)optimizer.atlasSettings.maxAtlasSize,
-                optimizer.atlasSettings.atlasPadding,
+                optimalPadding,
                 true);
 
             if (driverRes == null || driverRes.atlas == null)
@@ -2060,6 +2230,23 @@ namespace MilchZocker.AvatarOptimizer
 
             int atlasW = driverRes.width;
             int atlasH = driverRes.height;
+
+            if (optimizer.atlasSettings.optimizeFragmentation)
+            {
+                int attempt = 0;
+                var packing = driverRes;
+                while (attempt < 3)
+                {
+                    bool done = OptimizeAtlasFragmentation(driverTextures, ref packing.uvRects, ref packing.width, ref packing.height);
+                    if (done) break;
+                    attempt++;
+                    packing = ManagedAtlasPacker.PackTextures(driverTextures, Mathf.Max(packing.width, packing.height, (int)optimizer.atlasSettings.maxAtlasSize), optimalPadding, true);
+                    if (packing == null || packing.atlas == null) break;
+                }
+                driverRes = packing;
+                atlasW = driverRes.width;
+                atlasH = driverRes.height;
+            }
 
             var atlasesByRep = new Dictionary<string, (Texture2D atlas, Rect[] rects)>();
             atlasesByRep[driverProp] = (driverRes.atlas, driverRes.uvRects);
@@ -2084,7 +2271,7 @@ namespace MilchZocker.AvatarOptimizer
                     var res = ManagedAtlasPacker.PackTextures(
                         texturesByRepProp[repProp],
                         (int)optimizer.atlasSettings.maxAtlasSize,
-                        optimizer.atlasSettings.atlasPadding,
+                        optimalPadding,
                         true);
 
                     if (res == null || res.atlas == null)
@@ -2093,6 +2280,24 @@ namespace MilchZocker.AvatarOptimizer
                         return false;
                     }
                     atlasesByRep[repProp] = (res.atlas, res.uvRects);
+                }
+            }
+
+            // Optional seam padding and normal preservation for each rep atlas
+            if (optimizer.atlasSettings.padUVSeams || optimizer.atlasSettings.preserveNormalMaps)
+            {
+                foreach (var kvp in atlasesByRep)
+                {
+                    var rep = kvp.Key;
+                    var atlas = kvp.Value.atlas;
+                    var rects = kvp.Value.rects;
+                    if (atlas == null) continue;
+
+                    if (optimizer.atlasSettings.padUVSeams)
+                        PadUVSeams(atlas, rects, texturesByRepProp[rep], optimalPadding);
+
+                    if (optimizer.atlasSettings.preserveNormalMaps && IsNormalProperty(rep))
+                        EnsureReadableNormal(atlas);
                 }
             }
 
@@ -2168,6 +2373,31 @@ namespace MilchZocker.AvatarOptimizer
                 ApplyEnhancedBakingAndReplace(masterMat, mats, rectByMaterial);
             }
 
+            // After atlas creation, analyze and optionally apply density-based import settings
+            foreach (var kvp in atlasesByRep)
+            {
+                string propName = kvp.Key;
+                var atlas = kvp.Value.atlas;
+
+                var densityAnalysis = AnalyzeTextureDensity(atlas, propName);
+
+                string atlasPath = AssetDatabase.GetAssetPath(atlas);
+                if (string.IsNullOrEmpty(atlasPath))
+                {
+                    if (!atlasImportSettings.ContainsKey(atlas))
+                        atlasImportSettings[atlas] = densityAnalysis;
+                }
+                else
+                {
+                    ApplyDensityBasedImportSettings(atlas, atlasPath, densityAnalysis, propName);
+                }
+
+                if (optimizer.atlasSettings.verboseLogging)
+                {
+                    LogBuffered($"  Atlas {propName}: {densityAnalysis.tier.tierName} (Score: {densityAnalysis.complexityScore:F2}) - {densityAnalysis.analysisReason}");
+                }
+            }
+
             atlasesCreated = atlasesByRep.Count; // UNIQUE atlases only
             LogBuffered($"[AvatarOptimizer] ✓ {(enhanced ? "Enhanced" : "Standard")} atlasing complete for '{shaderName}' subset ({mats.Count}) - {atlasesCreated} unique atlases ({allowedProps.Count} props)");
             return true;
@@ -2228,7 +2458,18 @@ namespace MilchZocker.AvatarOptimizer
             }
         }
 
-        private Texture2D EnsureReadable(Texture2D tex)
+    
+    private Texture2D GetReadableTexture(Texture2D tex)
+    {
+        return EnsureReadable(tex);
+    }
+
+    private Color GetDefaultColorForProp(string propName)
+    {
+        bool isNormal = IsNormalProperty(propName);
+        return isNormal ? new Color(0.5f, 0.5f, 1f, 1f) : Color.white;
+    }
+    private Texture2D EnsureReadable(Texture2D tex)
         {
             if (tex == null) return null;
             try { if (tex.isReadable) return tex; } catch { }
@@ -2284,6 +2525,733 @@ namespace MilchZocker.AvatarOptimizer
             tex.Apply();
             return tex;
         }
+
+        #region Advanced Optimization Utilities
+
+        private int CalculateOptimalPadding(int baseAtlasSize)
+        {
+            int mipLevels = Mathf.FloorToInt(Mathf.Log(baseAtlasSize, 2)) + 1;
+            int minPaddingForMips = Mathf.Max(1, 1 << Mathf.Max(0, mipLevels - 6));
+            int finalPadding = Mathf.Max(minPaddingForMips, optimizer.atlasSettings.atlasPadding);
+            if (optimizer.atlasSettings.verboseLogging && finalPadding > optimizer.atlasSettings.atlasPadding)
+            {
+                LogBuffered($"  Increased padding to {finalPadding}px (from {optimizer.atlasSettings.atlasPadding}px) to prevent mip bleeding");
+            }
+            return finalPadding;
+        }
+
+        private bool OptimizeAtlasFragmentation(Texture2D[] textures, ref Rect[] rects, ref int atlasWidth, ref int atlasHeight)
+        {
+            if (!optimizer.atlasSettings.optimizeFragmentation) return true;
+            if (textures == null || rects == null || textures.Length == 0) return true;
+            
+            // Calculate current utilization
+            float usedArea = rects.Sum(r => r.width * r.height) * atlasWidth * atlasHeight;
+            float totalArea = atlasWidth * atlasHeight;
+            float utilization = usedArea / totalArea;
+            
+            // Check against configured target
+            if (utilization >= optimizer.atlasSettings.targetUtilization) return true;
+            
+            // If atlas is underutilized beyond configured threshold, try shrinking to a better-fit power-of-two size
+            float minRequiredArea = usedArea * 1.05f;
+            int newSize = Mathf.NextPowerOfTwo(Mathf.CeilToInt(Mathf.Sqrt(minRequiredArea)));
+            int maxTexDim = textures.Max(t => Mathf.Max(t.width, t.height));
+            newSize = Mathf.Max(newSize, Mathf.NextPowerOfTwo(maxTexDim));
+
+            if (newSize < Mathf.Min(atlasWidth, atlasHeight))
+            {
+                LogBuffered($"  Fragmentation: reducing atlas size from {atlasWidth}x{atlasHeight} to {newSize}x{newSize} (util={utilization:P1}, target={optimizer.atlasSettings.targetUtilization:P1})");
+                atlasWidth = newSize;
+                atlasHeight = newSize;
+                return false; // trigger repack with new size
+            }
+
+            return true;
+        }
+
+        private void PadUVSeams(Texture2D atlas, Rect[] uvRects, Texture2D[] sources, int padding)
+        {
+            if (atlas == null || uvRects == null || sources == null) return;
+            if (padding <= 0) return;
+
+            for (int i = 0; i < uvRects.Length && i < sources.Length; i++)
+            {
+                var rect = uvRects[i];
+                var src = sources[i];
+                if (src == null) continue;
+
+                int x = Mathf.Clamp(Mathf.RoundToInt(rect.x * atlas.width), 0, atlas.width - 1);
+                int y = Mathf.Clamp(Mathf.RoundToInt(rect.y * atlas.height), 0, atlas.height - 1);
+                int w = Mathf.Clamp(Mathf.RoundToInt(rect.width * atlas.width), 1, atlas.width - x);
+                int h = Mathf.Clamp(Mathf.RoundToInt(rect.height * atlas.height), 1, atlas.height - y);
+
+                for (int p = 1; p <= padding; p++)
+                {
+                    // Top and bottom rows
+                    for (int px = x; px < x + w; px++)
+                    {
+                        if (y - p >= 0)
+                            atlas.SetPixel(px, y - p, atlas.GetPixel(px, y));
+                        if (y + h + p - 1 < atlas.height)
+                            atlas.SetPixel(px, y + h + p - 1, atlas.GetPixel(px, y + h - 1));
+                    }
+
+                    // Left and right columns
+                    for (int py = y; py < y + h; py++)
+                    {
+                        if (x - p >= 0)
+                            atlas.SetPixel(x - p, py, atlas.GetPixel(x, py));
+                        if (x + w + p - 1 < atlas.width)
+                            atlas.SetPixel(x + w + p - 1, py, atlas.GetPixel(x + w - 1, py));
+                    }
+                }
+            }
+
+            atlas.Apply(false);
+        }
+
+        private string GetTextureFingerprint(Texture2D tex)
+        {
+            if (tex == null) return "null";
+            if (textureFingerprintCache.TryGetValue(tex, out string cached)) return cached;
+            var sb = new StringBuilder();
+            sb.Append($"{tex.width}x{tex.height}_{tex.format}_");
+            var readable = EnsureReadable(tex);
+            if (readable != null)
+            {
+                int sx = Mathf.Max(1, readable.width / 8);
+                int sy = Mathf.Max(1, readable.height / 8);
+                for (int y = 0; y < readable.height; y += sy)
+                {
+                    for (int x = 0; x < readable.width; x += sx)
+                    {
+                        var c = readable.GetPixel(x, y);
+                        sb.Append($"{c.r:F2}{c.g:F2}{c.b:F2}_");
+                    }
+                }
+            }
+            else
+            {
+                sb.Append(tex.GetInstanceID());
+            }
+            string fp = sb.ToString();
+            textureFingerprintCache[tex] = fp;
+            return fp;
+        }
+
+        private Texture2D GetCachedTexture(Texture2D original, Func<Texture2D, Texture2D> processor)
+        {
+            if (original == null) return null;
+            string fp = GetTextureFingerprint(original);
+            if (textureCache.TryGetValue(fp, out var cached)) return cached;
+            var processed = processor(original);
+            textureCache[fp] = processed;
+            return processed;
+        }
+
+        private Texture2D EnsureReadableNormal(Texture2D tex)
+        {
+            var readable = EnsureReadable(tex);
+            if (readable == null) return null;
+            var pixels = readable.GetPixels();
+            bool needsConversion = false;
+            for (int i = 0; i < Mathf.Min(64, pixels.Length); i++)
+            {
+                if (pixels[i].b < 0.5f)
+                {
+                    needsConversion = true; break;
+                }
+            }
+            if (needsConversion)
+            {
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    var n = new Vector3(pixels[i].r * 2f - 1f, pixels[i].g * 2f - 1f, pixels[i].b * 2f - 1f).normalized;
+                    if (n.z < 0) n.z = -n.z;
+                    pixels[i] = new Color(n.x * 0.5f + 0.5f, n.y * 0.5f + 0.5f, n.z * 0.5f + 0.5f, pixels[i].a);
+                }
+                readable.SetPixels(pixels);
+                readable.Apply(true);
+            }
+            return readable;
+        }
+
+        private void OptimizeIndexBuffer(Mesh mesh)
+        {
+            if (!optimizer.meshSettings.optimizeIndexBuffer || mesh == null) return;
+            try
+            {
+                // MeshUtility methods are not available in all Unity versions; use Mesh.Optimize() as a portable fallback.
+                try
+                {
+                    mesh.Optimize();
+                }
+                catch { /* non-fatal */ }
+
+                if (optimizer.meshSettings.verboseLogging)
+                    LogBuffered($"  Optimized index/vertex ordering for {mesh.name}");
+            }
+            catch (Exception ex)
+            {
+                LogBuffered($"  Index buffer optimization failed for {mesh.name}: {ex.Message}");
+            }
+        }
+
+        private void MergeIdenticalSubmeshes(Mesh mesh, Material[] materials)
+        {
+            if (mesh == null || materials == null || materials.Length <= 1) return;
+            var groups = new Dictionary<Material, List<int>>();
+            int count = Mathf.Min(materials.Length, mesh.subMeshCount);
+            for (int i = 0; i < count; i++)
+            {
+                var mat = materials[i];
+                if (mat == null) continue;
+                if (!groups.ContainsKey(mat)) groups[mat] = new List<int>();
+                groups[mat].Add(i);
+            }
+            if (groups.Count == count) return;
+
+            var newTris = new List<int[]>();
+            var newMats = new List<Material>();
+            int merged = 0;
+            foreach (var kv in groups)
+            {
+                newMats.Add(kv.Key);
+                if (kv.Value.Count == 1)
+                {
+                    newTris.Add(mesh.GetTriangles(kv.Value[0]));
+                }
+                else
+                {
+                    var combined = kv.Value.SelectMany(idx => mesh.GetTriangles(idx)).ToArray();
+                    newTris.Add(combined);
+                    merged += kv.Value.Count - 1;
+                }
+            }
+            if (merged == 0) return;
+            mesh.subMeshCount = newTris.Count;
+            for (int i = 0; i < newTris.Count; i++)
+            {
+                mesh.SetTriangles(newTris[i], i);
+            }
+            if (optimizer.meshSettings.verboseLogging)
+                LogBuffered($"  Merged {merged} submeshes in {mesh.name}");
+        }
+
+        private void StripUnusedVertexAttributesIntelligent(Mesh mesh, Material[] materials)
+        {
+            if (mesh == null || materials == null || !optimizer.meshSettings.intelligentAttributeStripping) return;
+            bool needTangents = false, needColors = false, needUV2 = false, needUV3 = false, needUV4 = false;
+            foreach (var mat in materials.Where(m => m != null && m.shader != null))
+            {
+                var sh = mat.shader;
+                int pc = ShaderUtil.GetPropertyCount(sh);
+                for (int i = 0; i < pc; i++)
+                {
+                    if (ShaderUtil.GetPropertyType(sh, i) == ShaderUtil.ShaderPropertyType.TexEnv)
+                    {
+                        string pname = ShaderUtil.GetPropertyName(sh, i).ToLower();
+                        if (pname.Contains("normal") || pname.Contains("bump")) needTangents = true;
+                        if (pname.Contains("_detail") || pname.Contains("_detailmask")) needUV2 = true;
+                    }
+                    else if (ShaderUtil.GetPropertyType(sh, i) == ShaderUtil.ShaderPropertyType.Color)
+                    {
+                        needColors = true;
+                    }
+                }
+                var sname = sh.name.ToLower();
+                if (sname.Contains("vertexcolor") || sname.Contains("vertexlit")) needColors = true;
+            }
+
+            bool modified = false;
+            if (!needTangents && mesh.tangents != null && mesh.tangents.Length > 0) { mesh.tangents = null; modified = true; }
+            if (!needColors && mesh.colors != null && mesh.colors.Length > 0) { mesh.colors = null; modified = true; }
+            try { if (!needUV2) { mesh.uv2 = null; modified = true; } } catch { }
+            try { if (!needUV3) { mesh.uv3 = null; modified = true; } } catch { }
+            try { if (!needUV4) { mesh.uv4 = null; modified = true; } } catch { }
+            if (modified && optimizer.meshSettings.verboseLogging)
+                LogBuffered($"  Stripped unused attributes from {mesh.name}");
+        }
+
+        #endregion
+
+        #region Texture Information Density Analysis
+
+        private struct TextureDensityAnalysis
+        {
+            public float complexityScore;
+            public AvatarOptimizer.CompressionTier tier;
+            public int uniqueColorCount;
+            public float edgeDensity;
+            public float colorVariance;
+            public string analysisReason;
+        }
+
+        /// <summary>
+        /// Analyzes texture complexity using weighted metrics
+        /// </summary>
+        private TextureDensityAnalysis AnalyzeTextureDensity(Texture2D texture, string propertyName)
+        {
+            if (texture == null)
+            {
+                return new TextureDensityAnalysis
+                {
+                    complexityScore = 0f,
+                    tier = null,
+                    analysisReason = "Null texture"
+                };
+            }
+
+            var analysis = new TextureDensityAnalysis();
+            
+            // Get readable copy for analysis
+            var readable = EnsureReadable(texture);
+            if (readable == null)
+            {
+                analysis.complexityScore = 0.5f;
+                analysis.tier = GetCompressionTierForScore(0.5f, propertyName);
+                analysis.analysisReason = "Unreadable texture - assuming medium";
+                return analysis;
+            }
+
+            // Sample pixels (stride to avoid processing every pixel on large textures)
+            int stride = Mathf.Max(1, readable.width / 256);
+            var sampledPixels = new List<Color32>();
+            
+            for (int y = 0; y < readable.height; y += stride)
+            {
+                for (int x = 0; x < readable.width; x += stride)
+                {
+                    sampledPixels.Add(readable.GetPixel(x, y));
+                }
+            }
+
+            // Metric 1: Unique color count (color diversity)
+            var uniqueColors = new HashSet<Color32>(sampledPixels).Count;
+            analysis.uniqueColorCount = uniqueColors;
+            float colorDiversity = Mathf.Clamp01(uniqueColors / 256f);
+
+            // Metric 2: Color variance (statistical spread)
+            float avgR = (float)sampledPixels.Average(c => c.r);
+            float avgG = (float)sampledPixels.Average(c => c.g);
+            float avgB = (float)sampledPixels.Average(c => c.b);
+            
+            float variance = (float)sampledPixels.Average(c =>
+            {
+                float dr = c.r - avgR;
+                float dg = c.g - avgG;
+                float db = c.b - avgB;
+                return (dr * dr + dg * dg + db * db) / (255f * 255f);
+            });
+            
+            analysis.colorVariance = variance;
+
+            // Metric 3: Edge density (high-frequency detail detection)
+            float edgeDensity = CalculateEdgeDensity(readable, stride);
+            analysis.edgeDensity = edgeDensity;
+
+            // Metric 4: Property name heuristics
+            float propertyBoost = GetPropertyComplexityBoost(propertyName);
+
+            // Combine metrics using configured weights
+            var settings = optimizer.atlasSettings;
+            float baseScore = 
+                (colorDiversity * settings.colorDiversityWeight) +
+                (variance * settings.colorVarianceWeight) +
+                (edgeDensity * settings.edgeDensityWeight);
+            
+            analysis.complexityScore = Mathf.Clamp01(baseScore + propertyBoost);
+
+            // Find matching tier
+            analysis.tier = GetCompressionTierForScore(analysis.complexityScore, propertyName);
+            
+            if (analysis.tier != null)
+            {
+                analysis.analysisReason = $"{analysis.tier.tierName} (score:{analysis.complexityScore:F3}, " +
+                                         $"colors:{uniqueColors}, edges:{edgeDensity:F3}, var:{variance:F3})";
+            }
+            else
+            {
+                analysis.analysisReason = $"No matching tier (score:{analysis.complexityScore:F3})";
+            }
+
+            return analysis;
+        }
+
+        /// <summary>
+        /// Find the appropriate compression tier for a given complexity score
+        /// </summary>
+        private AvatarOptimizer.CompressionTier GetCompressionTierForScore(float score, string propertyName)
+        {
+            var tiers = optimizer.atlasSettings.compressionTiers
+                .Where(t => t.enableTier)
+                .OrderBy(t => t.minComplexity)
+                .ToList();
+            
+            foreach (var tier in tiers)
+            {
+                // Check score range
+                if (score < tier.minComplexity || score > tier.maxComplexity)
+                    continue;
+                
+                // Check property filters
+                if (!string.IsNullOrEmpty(tier.propertyNameFilter))
+                {
+                    var filters = tier.propertyNameFilter.Split(',')
+                        .Select(f => f.Trim())
+                        .Where(f => !string.IsNullOrEmpty(f));
+                    
+                    bool matches = filters.Any(f => 
+                        propertyName.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
+                    
+                    if (!matches) continue;
+                }
+                
+                // Check property exclusions
+                if (!string.IsNullOrEmpty(tier.propertyNameExclude))
+                {
+                    var exclusions = tier.propertyNameExclude.Split(',')
+                        .Select(e => e.Trim())
+                        .Where(e => !string.IsNullOrEmpty(e));
+                    
+                    bool excluded = exclusions.Any(e => 
+                        propertyName.IndexOf(e, StringComparison.OrdinalIgnoreCase) >= 0);
+                    
+                    if (excluded) continue;
+                }
+                
+                return tier;
+            }
+            
+            // Fallback: return middle tier if no exact match
+            return tiers.Count > 0 ? tiers[tiers.Count / 2] : null;
+        }
+
+        /// <summary>
+        /// Calculate edge density for texture complexity
+        /// </summary>
+        private float CalculateEdgeDensity(Texture2D texture, int stride)
+        {
+            int edgeCount = 0;
+            int totalSamples = 0;
+            float edgeThreshold = optimizer.atlasSettings.edgeDetectionThreshold;
+            
+            for (int y = stride; y < texture.height - stride; y += stride)
+            {
+                for (int x = stride; x < texture.width - stride; x += stride)
+                {
+                    Color center = texture.GetPixel(x, y);
+                    Color right = texture.GetPixel(x + stride, y);
+                    Color down = texture.GetPixel(x, y + stride);
+                    
+                    float gradX = ColorDifference(center, right);
+                    float gradY = ColorDifference(center, down);
+                    float gradient = Mathf.Sqrt(gradX * gradX + gradY * gradY);
+                    
+                    if (gradient > edgeThreshold)
+                        edgeCount++;
+                    
+                    totalSamples++;
+                }
+            }
+            
+            return totalSamples > 0 ? (float)edgeCount / totalSamples : 0f;
+        }
+
+        /// <summary>
+        /// Get property-specific complexity modifier
+        /// </summary>
+        private float GetPropertyComplexityBoost(string propertyName)
+        {
+            string lower = propertyName.ToLower();
+            var settings = optimizer.atlasSettings;
+            
+            if (lower.Contains("main") || lower.Contains("albedo") || lower.Contains("diffuse") || lower.Contains("base"))
+                return settings.mainTextureComplexityBoost;
+            
+            if (lower.Contains("normal") || lower.Contains("bump"))
+                return settings.normalMapComplexityBoost;
+            
+            if (lower.Contains("detail"))
+                return settings.detailTextureComplexityBoost;
+            
+            if (lower.Contains("mask"))
+                return settings.maskTextureComplexityReduction;
+            
+            if (lower.Contains("emission") || lower.Contains("emissive"))
+                return settings.emissionTextureComplexityBoost;
+            
+            return 0f;
+        }
+
+        /// <summary>
+        /// Parse per-property override value
+        /// </summary>
+        private int GetPerPropertyValue(string overrideString, string propertyName)
+        {
+            if (string.IsNullOrEmpty(overrideString))
+                return -1;
+            
+            var overrides = overrideString
+                .Split(',')
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrEmpty(s));
+            
+            foreach (var override_ in overrides)
+            {
+                var parts = override_.Split(':');
+                if (parts.Length == 2 && parts[0].Trim().Equals(propertyName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(parts[1].Trim(), out int value))
+                        return value;
+                }
+            }
+            
+            return -1;
+        }
+
+        /// <summary>
+        /// Check if property is in comma-separated list
+        /// </summary>
+        private bool IsPropertyInList(string listString, string propertyName)
+        {
+            if (string.IsNullOrEmpty(listString))
+                return false;
+            
+            var items = listString
+                .Split(',')
+                .Select(s => s.Trim())
+                .Where(s => !string.IsNullOrEmpty(s));
+            
+            return items.Any(item => item.Equals(propertyName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private float ColorDifference(Color a, Color b)
+        {
+            float dr = a.r - b.r;
+            float dg = a.g - b.g;
+            float db = a.b - b.b;
+            return Mathf.Sqrt(dr * dr + dg * dg + db * db);
+        }
+
+        /// <summary>
+        /// Applies import settings based on texture density analysis and user configuration
+        /// </summary>
+        /// <summary>
+        /// Apply compression settings based on tier configuration
+        /// </summary>
+        private void ApplyDensityBasedImportSettings(Texture2D texture, string texturePath, TextureDensityAnalysis analysis, string propertyName)
+        {
+            if (string.IsNullOrEmpty(texturePath) || analysis.tier == null)
+                return;
+
+            TextureImporter importer = AssetImporter.GetAtPath(texturePath) as TextureImporter;
+            if (importer == null)
+                return;
+
+            var tier = analysis.tier;
+            
+            // Store original settings for logging
+            int originalMaxSize = importer.maxTextureSize;
+            int originalCrunchQuality = importer.crunchedCompression ? importer.compressionQuality : -1;
+
+            // Determine max texture size
+            int targetMaxSize = tier.maxTextureSize;
+            
+            // Check for per-property size override
+            if (optimizer.atlasSettings.enablePerPropertySizing)
+            {
+                int propertyOverride = GetPerPropertyValue(optimizer.atlasSettings.perPropertyAtlasSizes, propertyName);
+                if (propertyOverride > 0)
+                    targetMaxSize = propertyOverride;
+            }
+            
+            // Don't upscale beyond actual texture size
+            targetMaxSize = Mathf.Min(targetMaxSize, Mathf.Max(texture.width, texture.height));
+            targetMaxSize = Mathf.NextPowerOfTwo(targetMaxSize);
+
+            // Apply size
+            importer.maxTextureSize = targetMaxSize;
+            
+            // Crunch compression
+            if (optimizer.atlasSettings.useAdaptiveCompression)
+            {
+                importer.crunchedCompression = true;
+                
+                // Check for per-property crunch override
+                int crunchOverride = GetPerPropertyValue(optimizer.atlasSettings.perPropertyCrunchQuality, propertyName);
+                importer.compressionQuality = crunchOverride > 0 ? crunchOverride : tier.crunchQuality;
+            }
+            
+            // Check for uncompressed property
+            bool forceUncompressed = IsPropertyInList(optimizer.atlasSettings.uncompressedProperties, propertyName);
+            
+            // Compression format
+            if (forceUncompressed)
+            {
+                importer.textureCompression = TextureImporterCompression.Uncompressed;
+            }
+            else if (tier.useCustomFormat)
+            {
+                importer.textureCompression = TextureImporterCompression.Uncompressed;
+                
+                if (optimizer.atlasSettings.usePlatformSpecificCompression)
+                {
+                    // Standalone
+                    var standalonePlatform = new TextureImporterPlatformSettings
+                    {
+                        name = "Standalone",
+                        overridden = true,
+                        maxTextureSize = targetMaxSize,
+                        format = optimizer.atlasSettings.standaloneFormat
+                    };
+                    importer.SetPlatformTextureSettings(standalonePlatform);
+                    
+                    // Android
+                    var androidPlatform = new TextureImporterPlatformSettings
+                    {
+                        name = "Android",
+                        overridden = true,
+                        maxTextureSize = targetMaxSize,
+                        format = optimizer.atlasSettings.androidFormat
+                    };
+                    importer.SetPlatformTextureSettings(androidPlatform);
+                    
+                    // iOS
+                    var iosPlatform = new TextureImporterPlatformSettings
+                    {
+                        name = "iPhone",
+                        overridden = true,
+                        maxTextureSize = targetMaxSize,
+                        format = optimizer.atlasSettings.iosFormat
+                    };
+                    importer.SetPlatformTextureSettings(iosPlatform);
+                }
+                else
+                {
+                    var platformSettings = new TextureImporterPlatformSettings
+                    {
+                        name = "Standalone",
+                        overridden = true,
+                        maxTextureSize = targetMaxSize,
+                        format = tier.customFormat
+                    };
+                    importer.SetPlatformTextureSettings(platformSettings);
+                }
+            }
+            else
+            {
+                importer.textureCompression = optimizer.atlasSettings.compressAtlases 
+                    ? TextureImporterCompression.Compressed 
+                    : TextureImporterCompression.Uncompressed;
+            }
+            
+            // Filter mode
+            if (tier.overrideFilterMode)
+            {
+                importer.filterMode = tier.filterMode;
+            }
+            else if (optimizer.atlasSettings.optimizeFilterModes)
+            {
+                importer.filterMode = analysis.complexityScore >= 0.5f
+                    ? optimizer.atlasSettings.detailTextureFilter
+                    : optimizer.atlasSettings.simpleTextureFilter;
+            }
+            
+            // Anisotropic filtering
+            importer.anisoLevel = tier.anisoLevel;
+            
+            // Mipmap settings
+            bool generateMips = optimizer.atlasSettings.generateMipmaps;
+            
+            if (tier.forceGenerateMipmaps)
+                generateMips = true;
+            if (tier.disableMipmaps)
+                generateMips = false;
+            
+            importer.mipmapEnabled = generateMips;
+            if (generateMips)
+            {
+                importer.mipmapFilter = optimizer.atlasSettings.mipmapFilter == AvatarOptimizer.MipmapFilterMode.Box 
+                    ? TextureImporterMipFilter.BoxFilter 
+                    : TextureImporterMipFilter.KaiserFilter;
+                    
+                importer.fadeout = optimizer.atlasSettings.fadeOutMipmaps;
+                if (optimizer.atlasSettings.fadeOutMipmaps)
+                {
+                    importer.mipmapFadeDistanceStart = optimizer.atlasSettings.mipmapFadeStart;
+                    importer.mipmapFadeDistanceEnd = optimizer.atlasSettings.mipmapFadeStart + 3;
+                }
+            }
+            
+            // Color space handling
+            if (optimizer.atlasSettings.autoDetectColorSpace)
+            {
+                bool isNormal = IsNormalProperty(propertyName);
+                bool isLinear = propertyName.ToLower().Contains("metallic") || 
+                               propertyName.ToLower().Contains("roughness") ||
+                               propertyName.ToLower().Contains("mask");
+                
+                importer.sRGBTexture = !isNormal && !isLinear;
+            }
+            
+            // Normal map specific settings
+            if (optimizer.atlasSettings.preserveNormalMaps && IsNormalProperty(propertyName))
+            {
+                importer.textureType = TextureImporterType.NormalMap;
+                importer.convertToNormalmap = false;
+            }
+
+            // Verbose logging
+            if (optimizer.atlasSettings.verboseDensityLogging)
+            {
+                LogBuffered($"  Applied tier '{tier.tierName}' to {System.IO.Path.GetFileName(texturePath)}:");
+                LogBuffered($"    Property: {propertyName}");
+                LogBuffered($"    Complexity Score: {analysis.complexityScore:F3}");
+                LogBuffered($"    Analysis: {analysis.analysisReason}");
+                LogBuffered($"    Max Size: {originalMaxSize} → {targetMaxSize}");
+                
+                if (optimizer.atlasSettings.useAdaptiveCompression)
+                {
+                    string crunchChange = originalCrunchQuality >= 0 
+                        ? $"{originalCrunchQuality} → {tier.crunchQuality}" 
+                        : $"OFF → {tier.crunchQuality}";
+                    LogBuffered($"    Crunch Quality: {crunchChange}");
+                }
+                
+                if (tier.useCustomFormat)
+                {
+                    LogBuffered($"    Format: Custom ({tier.customFormat})");
+                }
+            }
+
+            // Save and reimport
+            EditorUtility.SetDirty(importer);
+            importer.SaveAndReimport();
+        }
+
+        private void ApplyPendingAtlasImportSettings()
+        {
+            var applied = new List<Texture2D>();
+            foreach (var kvp in atlasImportSettings)
+            {
+                var tex = kvp.Key;
+                var analysis = kvp.Value;
+                string path = AssetDatabase.GetAssetPath(tex);
+                if (!string.IsNullOrEmpty(path))
+                {
+                    string texName = Path.GetFileNameWithoutExtension(path);
+                    ApplyDensityBasedImportSettings(tex, path, analysis, texName);
+                    applied.Add(tex);
+                }
+            }
+
+            foreach (var t in applied)
+                atlasImportSettings.Remove(t);
+        }
+
+        #endregion
 
         private Texture2D BuildAtlasFromFixedLayout(Texture2D[] textures, Rect[] rects, int atlasWidth, int atlasHeight)
         {
@@ -2517,6 +3485,63 @@ namespace MilchZocker.AvatarOptimizer
             }
 
             return false;
+        }
+
+
+
+        /// <summary>
+        /// Validate UV coordinates are within acceptable bounds
+        /// </summary>
+        private bool ValidateUVBounds(Mesh mesh, out string warningMessage)
+        {
+            warningMessage = null;
+            
+            if (!optimizer.atlasSettings.validateUVBounds)
+                return true;
+            
+            if (mesh == null)
+                return true;
+            
+            var uvs = mesh.uv;
+            if (uvs == null || uvs.Length == 0)
+                return true;
+            
+            float minU = uvs.Min(uv => uv.x);
+            float maxU = uvs.Max(uv => uv.x);
+            float minV = uvs.Min(uv => uv.y);
+            float maxV = uvs.Max(uv => uv.y);
+            
+            bool isInvalid = minU < -0.01f || maxU > 1.01f || minV < -0.01f || maxV > 1.01f;
+            
+            if (isInvalid)
+            {
+                warningMessage = $"UVs out of bounds: U[{minU:F3}, {maxU:F3}] V[{minV:F3}, {maxV:F3}]";
+                
+                if (optimizer.atlasSettings.warnOnInvalidUVs)
+                {
+                    LogBuffered($"  WARNING: {mesh.name} - {warningMessage}");
+                }
+                
+                if (optimizer.atlasSettings.autoFixInvalidUVs)
+                {
+                    // Clamp or wrap UVs
+                    for (int i = 0; i < uvs.Length; i++)
+                    {
+                        uvs[i] = new Vector2(
+                            Mathf.Repeat(uvs[i].x, 1f),
+                            Mathf.Repeat(uvs[i].y, 1f)
+                        );
+                    }
+                    mesh.uv = uvs;
+                    LogBuffered($"    Auto-fixed UVs by wrapping to 0-1 range");
+                }
+                else if (optimizer.atlasSettings.skipInvalidUVMaterials)
+                {
+                    return false; // Signal to skip this material
+                }
+            }
+            
+            return true;
         }
 
         #endregion
