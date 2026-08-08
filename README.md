@@ -1,98 +1,276 @@
-# NDMF-Avatar-Optimization
+# NDMF Avatar Optimisation for ChilloutVR
 
-NDMF-Avatar-Optimization is a Unity NDMF tool for ChilloutVR that automates avatar cleanup while staying **non-destructive**. The processor duplicates meshes/materials when needed and bakes changes into a clone at upload/manual bake time, so original assets stay untouched. Pair it with **NDMF-Merge** if you already use it in your NDMF stack—the optimizer runs after other NDMF steps in the same pipeline.
+NDMF Avatar Optimisation is a conservative, non-destructive optimization tool for ChilloutVR avatars built on top of NDMF. Its purpose is simple: take a complex avatar, inspect its rig, materials, controllers, blendshapes, and mesh data, then make the safest possible cleanup and reduction passes during the build pipeline without mutating the original source assets.
 
-## What it does
-- **Animation-aware safety:** Scans CVR controllers and advanced avatar settings for animated bones, transforms, blendshapes, and materials so referenced content is protected before pruning or atlasing.
-- **Blendshape cleanup:** Removes unused or zero-delta blendshapes while preserving CVR blink/viseme/eye-look, face-tracking, and user-pattern matches.
-- **Bone cleanup:** Prunes unused bone references and optionally removes empty bones, with checks for Magica Cloth, Dynamic Bones, VRC PhysBones, constraints, child preservation, and name patterns.
-- **Mesh tuning:** Merges close vertices, deletes loose vertices, and can optionally combine compatible meshes, recalc normals/tangents, and apply compression.
-- **Atlas generation:** Builds texture atlases per shader/property group with animation-aware exclusions, shader/property filtering, enhanced workflow support, and compression control.
-- **Buffered reporting:** Buffers logs to avoid Unity truncation and prints chunked messages plus statistics (bones/blendshapes/vertices/meshes/atlases/time) every run.
+This package is designed to work especially well alongside NDMF Merge. If your avatar is being assembled from multiple outfits, accessories, or merged components, NDMF Merge handles the structural composition and NDMF Avatar Optimisation cleans up the resulting baked clone so it is lighter, simpler, and easier to maintain.
 
-## What it doesn’t do
-- **Does not alter originals:** All changes are applied to baked clones; original meshes/materials remain intact.
-- **Does not cover custom runtimes automatically:** Script-driven animations or bespoke systems are only preserved if they show up in controller/face-tracking data or your manual preserve patterns.
-- **Does not fully protect Magica Cloth 1:** Mesh/bone edits can still disrupt Magica Cloth 1 data (see Known limitations).
+> Recommended workflow: use NDMF Merge for assembly and NDMF Avatar Optimisation for cleanup. The optimizer runs after merge-related steps in the same NDMF pipeline, so the two tools complement each other naturally.
 
-## Requirements & installation
-- Unity **2019.3+** with a compatible ChilloutVR CCK.
-- **NDMF 1.4+** and **Chillaxins** installed.
-- Clone or add this repository into your project (e.g., under `Packages/NDMF-Avatar-Optimization`).
-- Enable local packages in **Project Settings → Package Manager** and verify the **Avatar Optimizer** component is available.
+---
 
-## Workflow
-1. Add the **Avatar Optimizer** component to your avatar root.
-2. Adjust settings (start with defaults; recommendations below).
-3. Upload or **Manual Bake** the avatar. The optimizer runs automatically in the NDMF pipeline—after other NDMF tools such as **NDMF-Merge**—to generate a clone, apply changes, buffer logs, and record stats.
-4. Review the baked clone—especially cloth/physics-heavy meshes—and iterate settings as needed.
+## ✨ Key Features
 
-## Detailed settings and recommendations
-Settings map directly to serialized fields in `AvatarOptimizer` and behaviors implemented in `AvatarOptimizationProcessor.cs`.
+### Non-destructive by design
+The optimizer works on a cloned bake result rather than directly rewriting your source assets. Meshes, materials, and bones are inspected and modified in the build-time clone, which keeps your original avatar data intact and makes it much safer to iterate.
 
-### Bone Optimization
-- **Remove unused bone references** (`removeUnusedBoneReferences`, default **on**): Rewrites skinning arrays to drop unreferenced bones per SkinnedMeshRenderer. Safe to keep enabled for most avatars.
-- **Only remove zero-weight bones** (`onlyRemoveZeroWeightBones`, default **on**) with **Minimum bone weight threshold** (`minimumBoneWeightThreshold`, default **0.0001**): Treats bones with weights above the threshold as used. Raise slightly if stray weights remain; lower for maximum caution.
-- **Remove bones without weights** (`removeBonesWithoutWeights`, default **off**): Identifies transforms not referenced by any mesh and reports candidates. With physics checks enabled, the processor logs Magica Cloth, Magica Cloth 2, Dynamic Bones, or VRC PhysBones before allowing removal.
-- **Checks for physics components** (`checkForMagicaCloth`, `checkForDynamicBones`, `checkForVRCPhysBones`, defaults **on**): Detects common physics systems and warns when manual confirmation is required.
-- **Manual confirmation per bone** (`manualConfirmationPerBone`, default **on**): Lists candidate bones with paths instead of removing automatically when physics is present. Disable once you trust your profile.
-- **Preserve animated bones** (`preserveAnimatedBones`, default **on**): Collects animated transforms from override/base controllers and advanced settings before pruning.
-- **Preserve bone name patterns** (`preserveBoneNamePatterns`, default `Hair,Skirt,Cloth,Breast,Tail`): Keeps bones containing these tokens; add your rig-specific patterns to avoid cloth/facial loss.
-- **Preserve children of used bones** (`preserveChildrenOfUsedBones`, default **on**): Retains descendants of kept bones to maintain hierarchies.
-- **Preserve bones with constraints** (`preserveBonesWithConstraints`, default **on**): Skips removal if any `*Constraint` component is attached.
+### Animation-aware safety
+The tool inspects the avatar's controllers, override controllers, advanced avatar settings, and related references to understand which bones, blendshapes, and material properties are actually in use. This is critical for CVR avatars, where facial systems, toggles, and physics-related rig elements can be easy to accidentally break.
 
-**Recommendations:** Keep all physics checks on. Turn on **Remove bones without weights** after verifying cloth/physics rigs, and expand name patterns for custom tails, skirts, or props.
+### Bone cleanup with protective checks
+The processor can remove unused bone references and identify bones that are no longer needed. Before doing anything destructive, it checks for common safety cases such as:
+- animated transforms
+- cloth and physics components
+- constraints
+- named bone patterns that should be preserved
+- children of used bones
 
-### Mesh Optimization
-- **Merge vertices by distance** (`mergeVerticesByDistance`, default **on**) with **Merge distance** (`mergeDistance`, default **0.0001**) plus optional **Compare normals** (`compareNormals`, default **on** / **Normal angle threshold** default **5°**) and **Compare UVs** (`compareUVs`, default **off** / **UV distance threshold** default **0.01**): Collapses near-duplicate vertices while respecting shading and (optionally) UV layout.
-- **Delete loose vertices** (`deleteLooseVertices`, default **on**): Removes vertices unused by any triangle—safe baseline cleanup.
-- **Combine meshes** (`combineMeshes`, default **off**): Groups meshes with compatible materials, skips those with animated transforms (except blendshape-only), and merges to reduce draw calls.
-- **Recalculate normals/tangents** (`recalculateNormals`, `recalculateTangents`, defaults **off**): Rebuilds shading data post-merge; enable if you see shading seams after vertex/mesh merges.
-- **Optimize mesh for rendering** (`optimizeMeshForRendering`, default **on**): Runs Unity’s mesh optimizer—leave enabled unless debugging.
-- **Apply mesh compression** (`applyMeshCompression`, default **off**) with **Compression level** (`Low/Medium/High`, default **Medium**): Reduces mesh memory; verify hero assets for quality.
-- **Mesh name filter/exclude** (`meshNameFilter`, `meshNameExclude`): Comma-separated includes/excludes so you can isolate or skip specific renderers.
+This makes the bone cleanup system much more conservative than a generic mesh optimizer.
 
-**Recommendations:** Keep vertex merging and loose-vertex cleanup on. Combine meshes selectively for performance-heavy avatars. Add filters to skip FX or delicate cloth meshes.
+### Blendshape cleanup
+Blendshapes are one of the most delicate parts of a CVR avatar. The tool can remove unused or near-empty blendshapes, but it is careful to preserve facial systems such as blink, viseme, eye-look, and face-tracking shapes unless you explicitly opt out of that protection.
 
-### Blendshape Optimization
-- **Remove unused blendshapes** (`removeUnusedBlendshapes`, default **on**): Scans animations, CVR blink/viseme/eye-look, and CVRFaceTracking to mark shapes as used before removal.
-- **Scan override/advanced controllers** (`scanOverrideController`, `scanAdvancedAvatarSettings`, defaults **on**): Searches Animator/Override controllers referenced by CVR advanced settings to preserve animated blendshapes.
-- **Preserve blink/viseme/face-tracking/eye-look** (`preserveBlinkBlendshapes`, `preserveVisemeBlendshapes`, `preserveFaceTrackingBlendshapes`, `preserveEyeLookBlendshapes`, defaults **on**): Retains the core facial feature set.
-- **Remove zero-delta blendshapes** (`removeZeroDeltaBlendshapes`, default **on**) with **Zero-delta threshold** (`zeroDeltaThreshold`, default **0.00001m**): Deletes shapes whose vertex deltas fall below the threshold.
-- **Preserve/force-remove patterns** (`preserveBlendshapePatterns`, `forceRemoveBlendshapePatterns`): Comma-separated patterns applied after scans. Patterns are logged when used.
-- **Verbose logging** (`verboseLogging`, default **off**): Prints each preserved/removed blendshape during scans.
+### Mesh optimisation and safe merging
+The optimizer can:
+- merge nearby vertices
+- delete loose vertices
+- recalculate normals and tangents
+- optionally combine compatible meshes
+- reduce draw-call pressure where the mesh data is clearly safe to combine
 
-**Recommendations:** Leave all scans and facial preserves on. Use preserve patterns for custom visemes/ARKit sets; force-remove for known dead/test shapes.
+The implementation is intentionally cautious, especially for skinned meshes, and it avoids unsafe merges when the rig or blendshape setup would be at risk.
 
-### Texture Atlas Generation
-- **Generate texture atlas** (`generateTextureAtlas`, default **off**): Duplicates materials and atlases by shader group; renderer slots are swapped to the copies so originals stay intact.
-- **Exclude animated materials** (`excludeAnimatedMaterials`, default **on**) with **Scan override/advanced controllers** (`scanOverrideController`, `scanAdvancedAvatarSettings`, defaults **on**): Gathers animated material properties and skips those materials to avoid breaking swaps.
-- **Exclude material patterns** (`excludeMaterialPatterns`): Comma-separated names to skip (FX/UI/etc.).
-- **Atlas generation modes:**
-  - **Enhanced workflow** (`useEnhancedAtlasWorkflow`, default **off**): Groups properties by texture signature, filters non-2D slots, and recursively packs subsets for better results without external tools.
-  - **Merge identical textures** (`mergeIdenticalTextures`, default **off**): Experimental mode that groups materials sharing texture sets before atlasing.
-  - **Standard automatic**: Default when neither enhanced nor merge mode is selected.
-- **Basic atlas settings:** **Max atlas size** (`maxAtlasSize`, default **2048**), **Atlas padding** (`atlasPadding`, default **2px**).
-- **Advanced filters:** **Minimum materials for atlas** (`minimumMaterialsForAtlas`, default **2**), **Allowed/excluded texture properties** (`allowedTextureProperties` default `*`, `excludedTextureProperties`), **Minimum texture size** (`minimumTextureSize`, default **32px**).
-- **Shader filtering:** **Allowed shader names** (`allowedShaderNames`) and **Excluded shader names** (`excludedShaderNames`, default `Hidden,UI,Unlit/Transparent`).
-- **Compression:** **Compress atlases** (`compressAtlases`, default **on**) with **Compression format** (`compressionFormat`, default **Automatic**, options DXT1/DXT5/BC7/ASTC/Uncompressed).
-- **Verbose logging** (`verboseLogging`, default **off**): Logs inclusion/exclusion decisions and atlas grouping.
+### Texture atlas generation
+The package can generate texture atlases for compatible materials, group them by shader and property usage, and apply compression controls. It also includes animation safety checks so materials used by controllers are not casually included in atlases and broken by shader-property changes.
 
-**Recommendations:** Keep animation scans on. Start with enhanced workflow + compression. Tighten shader/property filters if certain materials must remain separate.
+### Analysis and reporting
+The tool records findings, warnings, and summary information and can run in report-only mode so you can review what it would change before allowing destructive operations. This is especially useful for the first bake of a new avatar or when you are tuning a complex rig.
 
-## Known limitations and considerations
-- **Magica Cloth 1 interference:** Mesh edits (vertex merges, atlas UV changes) and bone removals can disrupt Magica Cloth 1 or other components that rely on original mesh data. There is detection/guard logic, but it is not fully reliable yet; you may need to rebuild cloth mesh data manually after processing. This also means running automatically on Play/Bundle may not suit Magica Cloth 1 setups—prefer Manual Bake and review.
-- **Controller coverage:** The processor inspects CVR controllers and advanced settings. Scripted or runtime-only animation changes won’t be detected unless you mirror them in controllers or add preserve patterns.
-- **Compression quality:** High mesh/texture compression can visibly degrade hero assets; test critical looks.
+---
 
-## Troubleshooting
-- **Unexpected cloth or physics breaks:** Disable bone removal or vertex merging for affected meshes; keep Magica/Dynamic/PhysBone checks on.
-- **Missing animations or blendshapes:** Ensure controllers are assigned before building and that preserve patterns cover custom shapes.
-- **Atlas artifacts:** Increase padding, reduce compression, or exclude problematic shaders/materials.
-- **Tool not visible:** Confirm the package path exists under `Packages/` and local packages are enabled in Package Manager settings.
+## 📦 Requirements
 
-## Logging and statistics
-Logs are buffered to avoid truncation and emitted in numbered chunks with start/end banners. Stats reported per run: bones removed, bone references removed, blendshapes removed, vertices merged, loose vertices removed, meshes combined, atlases generated, and total optimization time.
+- Unity 2021.3 or newer
+- ChilloutVR CCK imported into the project
+- NDMF 1.4+ installed
+- Chillaxins installed for the package to load correctly in the NDMF ecosystem
+- Optional but strongly recommended: NDMF Merge for avatar assembly and outfit merging
 
-## Complementary usage with NDMF-Merge
-NDMF-Avatar-Optimization and NDMF-Merge are tuned to work together inside the NDMF pipeline. If your project includes NDMF-Merge, it runs first on the base avatar and the optimizer follows automatically, so both tools contribute to a consistent baked clone without manual reordering.
+---
+
+## 🚀 Installation
+
+### Option A: Install via Unity Package Manager (Git URL)
+1. Open Window → Package Manager
+2. Click the + button in the top-left corner
+3. Choose Add package from git URL...
+4. Enter:
+   `https://github.com/MilchZocker/NDMF-Avatar-Optimisation.git#upm`
+5. Click Add
+
+### Option B: Manual installation
+Copy the repository into your project's Packages directory so the package is available as a local Unity package.
+
+Once installed, make sure that local packages are enabled in Project Settings → Package Manager.
+
+---
+
+## 🧩 Setup Guide
+
+### 1. Add the component
+Select your avatar root object, the object that already contains your CVR avatar setup, and add the component:
+- NDMF Avatar Optimizer → Avatar Optimizer
+
+This component is the main user-facing control surface for the optimizer.
+
+### 2. Start conservatively
+For the first run, keep the default settings and review the output carefully. The optimizer is designed to be safe, but avatars can vary a lot in how their bones, materials, and controllers are wired.
+
+If you want a preview-first workflow, enable report-only mode before making broader changes.
+
+### 3. Bake the avatar
+Upload your avatar or use Manual Bake in NDMF. The plugin runs automatically during the NDMF build pipeline and applies optimization to the baked clone.
+
+### 4. Review the result
+After baking, inspect:
+- cloth and physics-driven bones
+- facial blendshape behavior
+- material appearance and UVs
+- mesh deformation or seams
+- any log warnings or analysis findings
+
+If something looks wrong, tune the settings rather than immediately turning everything on.
+
+---
+
+## 🛠️ How the optimizer works
+
+The optimizer does not directly rewrite your source hierarchy in place. Instead, it runs in the NDMF build flow and works on the generated avatar clone created for the bake.
+
+The general flow is:
+1. NDMF prepares the avatar and build context
+2. The plugin locates the Avatar Optimizer component
+3. The processor analyzes the avatar's bones, controllers, mesh data, blendshapes, materials, and physics-related references
+4. It applies the selected cleanup passes in a conservative order
+5. It emits logs and statistics for review
+
+The plugin is registered as an NDMF build step and is intentionally positioned after merge-related steps so it can clean up the final merged avatar rather than the pre-merge source structure.
+
+---
+
+## ⚙️ Detailed Configuration
+
+The component exposes several groups of settings. They are implemented in the runtime component and consumed by the build processor. The main categories are described below.
+
+### Bone optimisation
+Bone cleanup is one of the most sensitive areas in an avatar pipeline. The optimizer can remove unused bone references and, in some cases, remove actual empty bones, but it does so with multiple safety rails.
+
+Key settings include:
+- Remove unused bone references
+- Only remove zero-weight bones
+- Minimum weight threshold
+- Preserve animated bones
+- Preserve bone name patterns
+- Preserve children of used bones
+- Preserve bones with constraints
+- Physics checks for Magica Cloth, Dynamic Bones, and VRC PhysBones
+- Manual confirmation mode for risky removals
+
+Recommended starting point:
+- Keep physics checks enabled
+- Leave manual confirmation on while you are still learning your avatar’s rig
+- Expand preserve name patterns for custom cloth, tail, breast, or accessory bones if needed
+
+### Mesh optimisation
+Mesh optimization is generally safe when it is conservative, but it can quickly become destructive if applied too aggressively to skinned avatars.
+
+Key settings include:
+- Merge vertices by distance
+- Compare normals and UVs when merging
+- Delete loose vertices
+- Combine compatible meshes
+- Recalculate normals/tangents
+- Optimize mesh for rendering
+- Apply mesh compression
+- Name-based include/exclude filters
+
+Recommended starting point:
+- Keep vertex merging and loose-vertex cleanup enabled
+- Leave mesh combining off until you have validated a few bakes
+- Use mesh name filters to exclude delicate or special-case meshes
+
+### Blendshape optimisation
+Blendshapes are preserved by default where the tool can tell they are part of core CVR facial systems or user-defined facial behavior. The optimizer can also remove near-empty blendshapes to reduce data overhead.
+
+Key settings include:
+- Remove unused blendshapes
+- Scan override controllers and advanced avatar settings
+- Preserve blink, viseme, face-tracking, and eye-look shapes
+- Remove zero-delta blendshapes
+- Preserve/force-remove patterns by name
+- Verbose logging for debugging
+
+Recommended starting point:
+- Leave facial preserve options enabled
+- Use preserve patterns for custom face systems
+- Only rely on forced removals for clearly dead or test shapes
+
+### Texture atlas generation
+The atlas system is meant to reduce texture draw-call pressure and improve material packing while trying to keep the avatar safe. It can group compatible materials and generate atlases using a shader/property-aware workflow.
+
+Key settings include:
+- Generate texture atlas
+- Exclude animated materials
+- Scan override controllers and advanced avatar settings for material animation
+- Exclude material patterns
+- Atlas size and padding
+- Shader and property filters
+- Compression settings
+- Enhanced workflow and texture deduplication toggles
+
+Recommended starting point:
+- Leave atlasing off until you have a stable bake
+- Enable it only for avatars with many materials that are clearly safe to group
+- Tighten shader/property filters for special materials or UI-like shaders
+
+### Analysis and reporting
+The tool can run in a report-only mode where it explains what it would change without applying destructive changes. This is very useful when you want a safer onboarding experience or when you are adapting the package to a new avatar structure.
+
+Recommended starting point:
+- Review the analysis report before turning on stronger cleanup passes
+- Use it to find candidate bones, blendshapes, and materials that deserve a second look
+
+---
+
+## ✅ Recommended workflow for most avatars
+
+1. Add the Avatar Optimizer component to the avatar root
+2. Leave the optimizer in a conservative state for the first bake
+3. Review the logs and analysis findings
+4. Enable more aggressive cleanup only after the avatar behaves correctly in the bake output
+5. Repeat with small, testable changes rather than turning on every optimization at once
+
+This workflow is especially helpful for avatars with:
+- custom facial systems
+- cloth or physics setups
+- multiple materials and shader variants
+- complex rigs or nonstandard bones
+
+---
+
+## 🔧 Troubleshooting
+
+### My avatar deforms after baking
+- Disable or reduce mesh combining
+- Recheck bone removal decisions
+- Review whether the affected mesh has blendshapes or special rig data
+- Inspect the logs for preserved or removed bone references
+
+### Cloth or physics looks wrong
+- Keep physics checks enabled
+- Review the candidate bone list before removing bones
+- Use more conservative preserve patterns
+- Prefer manual bake and inspect the result before upload
+
+### Blendshapes are missing
+- Confirm the controllers are assigned correctly
+- Ensure preserve patterns include the relevant names
+- Check whether the blendshape was actually used in the controller or CVR facial data
+
+### Atlas generation looks broken
+- Increase padding
+- Reduce compression quality
+- Exclude problematic materials or shaders
+- Use tighter property filters
+
+### The component does not appear
+- Confirm that the package is installed correctly
+- Verify local packages are enabled
+- Make sure the project has the required NDMF and Chillaxins dependencies
+
+---
+
+## 🧠 Best Practices
+
+- Start with the safest settings and only increase aggressiveness after validation
+- Use Manual Bake first before uploading to a live avatar
+- Keep cloth, physics, and facial systems under review during the first few bakes
+- Prefer report-only analysis when first adapting the package to a new avatar
+- Use name-based preserve patterns for custom rig elements that should never be removed
+- Treat the optimizer as a cleanup and safety tool, not as a replacement for careful avatar authoring
+
+---
+
+## 🤝 Complementary use with NDMF Merge
+
+NDMF Merge and NDMF Avatar Optimisation are meant to work together.
+
+- NDMF Merge helps assemble and merge outfits, accessories, and armature structures into a single avatar build target
+- NDMF Avatar Optimisation helps reduce and clean up the resulting baked clone so it is lighter, easier to maintain, and less likely to carry unnecessary overhead
+
+This pairing is especially effective when you want a build pipeline that is both powerful and safe.
+
+---
+
+## 📄 License
+
+This project is distributed under the MIT License. See the LICENSE file for details.

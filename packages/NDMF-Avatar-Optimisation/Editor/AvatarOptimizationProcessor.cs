@@ -24,6 +24,7 @@ namespace MilchZocker.AvatarOptimizer
         private readonly Dictionary<SkinnedMeshRenderer, Mesh> optimizedMeshes = new Dictionary<SkinnedMeshRenderer, Mesh>();
         private readonly Dictionary<Material, Material> materialCopies = new Dictionary<Material, Material>();
         private readonly Dictionary<Transform, HashSet<string>> animatedTransformProperties = new Dictionary<Transform, HashSet<string>>();
+        private readonly List<OptimizationIssue> optimizationIssues = new List<OptimizationIssue>();
 
         // Pending atlas import settings (for atlases that haven't been saved to AssetDatabase yet)
         private readonly Dictionary<Texture2D, TextureDensityAnalysis> atlasImportSettings = new Dictionary<Texture2D, TextureDensityAnalysis>();
@@ -76,6 +77,38 @@ namespace MilchZocker.AvatarOptimizer
         private Type cvrFaceTrackingType;
 
         private MaterialAtlasAnalysis atlasAnalysis;
+
+        public enum OptimizationCategory
+        {
+            Animator,
+            Mesh,
+            Material,
+            Blendshape,
+            Physics,
+            Shader,
+            General
+        }
+
+        public enum OptimizationSeverity
+        {
+            Info,
+            Warning,
+            Error
+        }
+
+        public class OptimizationIssue
+        {
+            public OptimizationCategory Category;
+            public OptimizationSeverity Severity;
+            public string Title;
+            public string Description;
+            public string SuggestedAction;
+            public bool CanAutoFix;
+            public Component TargetComponent;
+            public int? BeforeValue;
+            public int? AfterValue;
+            public string IssueKey;
+        }
 
         // ===== Buffered logging (chunked final log) =====
         private readonly StringBuilder logBuffer = new StringBuilder(8192);
@@ -486,6 +519,846 @@ namespace MilchZocker.AvatarOptimizer
             return string.Join("|", parts);
         }
 
+        private void AnalyzeAvatar()
+        {
+            optimizationIssues.Clear();
+            AnalyzeAvatarState(optimizationIssues);
+
+            optimizer.stats.analysisIssues = optimizationIssues.Count;
+            optimizer.stats.analysisWarnings = optimizationIssues.Count(issue => issue.Severity == OptimizationSeverity.Warning);
+            optimizer.stats.analysisInfos = optimizationIssues.Count(issue => issue.Severity == OptimizationSeverity.Info);
+            optimizer.stats.lastAnalysisReport = BuildAnalysisReport();
+
+            if (optimizer.reportingSettings.showOptimizationSummary && optimizationIssues.Count > 0)
+            {
+                LogBuffered($"[AvatarOptimizer] Analysis found {optimizationIssues.Count} optimization findings");
+                foreach (var issue in optimizationIssues.Take(Mathf.Min(optimizer.reportingSettings.maxIssuesPerCategory, optimizationIssues.Count)))
+                {
+                    LogBuffered($"[AvatarOptimizer] [{issue.Severity}] {issue.Title}: {issue.Description}");
+                }
+            }
+            else if (optimizer.reportingSettings.showOptimizationSummary)
+            {
+                LogBuffered("[AvatarOptimizer] Analysis found no optimization findings");
+            }
+        }
+
+        private void AnalyzeAvatarState(List<OptimizationIssue> issues)
+        {
+            if (optimizer.animatorAnalysisSettings.enableAnalysis)
+            {
+                AnalyzeAnimators(issues);
+            }
+
+            if (optimizer.meshAnalysisSettings.enableAnalysis)
+            {
+                AnalyzeMeshesAndMaterials(issues);
+            }
+
+            if (optimizer.blendshapeAnalysisSettings.enableAnalysis)
+            {
+                AnalyzeBlendshapes(issues);
+            }
+
+            if (optimizer.physicsAnalysisSettings.enableAnalysis)
+            {
+                AnalyzePhysics(issues);
+            }
+        }
+
+        private void AnalyzeAnimators(List<OptimizationIssue> issues)
+        {
+            var animators = context.AvatarRootTransform.GetComponentsInChildren<Animator>(true);
+            foreach (var animator in animators)
+            {
+                if (animator == null) continue;
+
+                var controller = animator.runtimeAnimatorController;
+                if (controller == null) continue;
+
+                var avatarControllers = GetAvatarAnimatorControllers().ToList();
+                if (avatarControllers.Count == 0)
+                {
+                    avatarControllers.Add(controller);
+                }
+
+                var analysisController = avatarControllers.FirstOrDefault(candidate => candidate != null && candidate.name == controller.name)
+                    ?? controller;
+
+                int layerCount = 0;
+                int parameterCount = 0;
+                int boolParameterCount = 0;
+                int selfTransitionCount = 0;
+
+                if (analysisController is AnimatorController animatorController)
+                {
+                    layerCount = animatorController.layers.Length;
+                    parameterCount = animatorController.parameters.Length;
+                    boolParameterCount = animatorController.parameters.Count(p => p.type == AnimatorControllerParameterType.Bool);
+                    selfTransitionCount = CountSelfTransitions(animatorController);
+                }
+                else if (analysisController is AnimatorOverrideController overrideController)
+                {
+                    var overriddenController = overrideController.runtimeAnimatorController as AnimatorController;
+                    if (overriddenController != null)
+                    {
+                        layerCount = overriddenController.layers.Length;
+                        parameterCount = overriddenController.parameters.Length;
+                        boolParameterCount = overriddenController.parameters.Count(p => p.type == AnimatorControllerParameterType.Bool);
+                    }
+                }
+
+                if (optimizer.animatorAnalysisSettings.warnOnExcessiveLayers && layerCount > optimizer.animatorAnalysisSettings.maxRecommendedLayers)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Animator,
+                        OptimizationSeverity.Warning,
+                        $"Controller '{analysisController.name}' uses {layerCount} layers",
+                        "This controller is likely to be more expensive than necessary. Consider reducing layer count or consolidating toggle-heavy structure.",
+                        "Simplify layers and consolidate toggles where possible.",
+                        false,
+                        animator,
+                        $"AnimatorLayers:{animator.GetInstanceID()}");
+                }
+
+                if (optimizer.animatorAnalysisSettings.warnOnExcessiveParameters && parameterCount > optimizer.animatorAnalysisSettings.maxRecommendedParameters)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Animator,
+                        OptimizationSeverity.Warning,
+                        $"Controller '{analysisController.name}' uses {parameterCount} parameters",
+                        "Too many parameters can increase animator overhead and make the setup harder to maintain.",
+                        "Reduce redundant parameters and consolidate similar toggles.",
+                        false,
+                        animator,
+                        $"AnimatorParameters:{animator.GetInstanceID()}");
+                }
+
+                if (optimizer.animatorAnalysisSettings.warnOnHeavyToggleSetup && optimizer.animatorAnalysisSettings.preferDirectBlendTreesForHeavyToggles && boolParameterCount > optimizer.animatorAnalysisSettings.maxRecommendedBoolParameters)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Animator,
+                        OptimizationSeverity.Info,
+                        $"Controller '{analysisController.name}' has {boolParameterCount} bool parameters",
+                        "Toggle-heavy controllers can benefit from lighter controller structures and more compact parameter usage, especially for CVR facial and toggle systems.",
+                        "Consider consolidating toggles, using direct blend trees, or splitting facial logic into smaller layered controllers.",
+                        false,
+                        animator,
+                        $"AnimatorBoolParams:{animator.GetInstanceID()}");
+                }
+
+                if (optimizer.animatorAnalysisSettings.warnOnSelfTransitions && selfTransitionCount > 0)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Animator,
+                        OptimizationSeverity.Info,
+                        $"Controller '{analysisController.name}' uses {selfTransitionCount} self-transition(s)",
+                        "Self-transitions can make controller flow harder to maintain and can be harder to reason about for facial or toggle-heavy setups.",
+                        "Prefer explicit state branches, direct blend trees, or a simpler layered structure instead of self-transitions.",
+                        false,
+                        animator,
+                        $"AnimatorSelfTransitions:{animator.GetInstanceID()}");
+                }
+            }
+        }
+
+        private int CountSelfTransitions(AnimatorController controller)
+        {
+            if (controller == null)
+            {
+                return 0;
+            }
+
+            var count = 0;
+            foreach (var layer in controller.layers)
+            {
+                count += CountSelfTransitionsInStateMachine(layer.stateMachine);
+            }
+
+            return count;
+        }
+
+        private int CountSelfTransitionsInStateMachine(AnimatorStateMachine stateMachine)
+        {
+            if (stateMachine == null)
+            {
+                return 0;
+            }
+
+            var count = 0;
+            foreach (var state in stateMachine.states)
+            {
+                if (state.state == null)
+                {
+                    continue;
+                }
+
+                foreach (var transition in state.state.transitions)
+                {
+                    if (transition == null)
+                    {
+                        continue;
+                    }
+
+                    if (transition.destinationState != null && transition.destinationState == state.state)
+                    {
+                        count++;
+                    }
+                }
+            }
+
+            foreach (var subStateMachine in stateMachine.stateMachines)
+            {
+                count += CountSelfTransitionsInStateMachine(subStateMachine.stateMachine);
+            }
+
+            return count;
+        }
+
+        private void AnalyzeMeshesAndMaterials(List<OptimizationIssue> issues)
+        {
+            var renderers = context.AvatarRootTransform.GetComponentsInChildren<Renderer>(true);
+            var materialSlotCount = 0;
+            var meshCount = 0;
+
+            foreach (var renderer in renderers)
+            {
+                if (renderer == null) continue;
+                meshCount++;
+                materialSlotCount += renderer.sharedMaterials?.Count(mat => mat != null) ?? 0;
+
+                var materials = (renderer.sharedMaterials ?? Array.Empty<Material>()).Where(mat => mat != null).ToList();
+                if (materials.Count > 2)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Material,
+                        OptimizationSeverity.Info,
+                        $"Renderer '{renderer.name}' uses {materials.Count} material slots",
+                        "More material slots on a single renderer can increase draw-call complexity and make material grouping less efficient.",
+                        "Try consolidating compatible materials or reducing the number of per-renderer material assignments.",
+                        false,
+                        renderer,
+                        $"MaterialSlots:{renderer.GetInstanceID()}");
+                }
+
+                foreach (var material in materials)
+                {
+                    if (material == null) continue;
+                    if (material.renderQueue >= 3000 || material.shader != null && material.shader.name.Contains("Transparent", StringComparison.OrdinalIgnoreCase))
+                    {
+                        AddIssue(
+                            issues,
+                            OptimizationCategory.Shader,
+                            OptimizationSeverity.Warning,
+                            $"Material '{material.name}' uses a transparent-style shader",
+                            "Transparent materials often cost more to render and may be a good target for simplification or fallback.",
+                            "Prefer opaque or cutout-friendly materials where the visual result allows it.",
+                            false,
+                            renderer,
+                            $"TransparentShader:{material.GetInstanceID()}");
+                        break;
+                    }
+                }
+            }
+
+            if (meshCount > optimizer.meshAnalysisSettings.maxRecommendedMeshCount)
+            {
+                AddIssue(
+                    issues,
+                    OptimizationCategory.Mesh,
+                    OptimizationSeverity.Warning,
+                    $"Avatar uses {meshCount} renderers",
+                    "A large number of renderers can increase draw-call pressure and make the avatar more expensive to render.",
+                    "Merge compatible meshes and reduce unnecessary renderers where possible.",
+                    false,
+                    null,
+                    "MeshCount");
+            }
+
+            if (materialSlotCount > optimizer.meshAnalysisSettings.maxRecommendedMaterialSlots)
+            {
+                AddIssue(
+                    issues,
+                    OptimizationCategory.Material,
+                    OptimizationSeverity.Warning,
+                    $"Avatar uses {materialSlotCount} material slots",
+                    "Many material slots can increase draw-call cost and material overhead.",
+                    "Combine compatible materials and reduce unnecessary texture/material sets.",
+                    false,
+                    null,
+                    "MaterialSlotCount");
+            }
+        }
+
+        private void AnalyzeBlendshapes(List<OptimizationIssue> issues)
+        {
+            var skinnedMeshRenderers = context.AvatarRootTransform.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            foreach (var renderer in skinnedMeshRenderers)
+            {
+                if (renderer == null || renderer.sharedMesh == null) continue;
+
+                var mesh = renderer.sharedMesh;
+                var blendshapeCount = mesh.blendShapeCount;
+
+                if (blendshapeCount > 12)
+                {
+                    AddIssue(
+                        issues,
+                        OptimizationCategory.Blendshape,
+                        OptimizationSeverity.Info,
+                        $"Skinned mesh '{renderer.name}' uses {blendshapeCount} blendshapes",
+                        "Large blendshape counts can increase mesh memory and processing cost. Review whether all shapes are still needed.",
+                        "Remove unused or near-zero-delta blendshapes while preserving CVR facial systems.",
+                        true,
+                        renderer,
+                        $"BlendshapeCount:{renderer.GetInstanceID()}");
+                }
+
+                if (optimizer.blendshapeAnalysisSettings.preserveCVRFacialShapes)
+                {
+                    var facialLikeBlendshapes = new List<string>();
+                    for (int i = 0; i < blendshapeCount; i++)
+                    {
+                        var blendshapeName = mesh.GetBlendShapeName(i);
+                        if (IsFacialLikeBlendshapeName(blendshapeName))
+                        {
+                            facialLikeBlendshapes.Add(blendshapeName);
+                        }
+                    }
+
+                    if (facialLikeBlendshapes.Count > 0)
+                    {
+                        AddIssue(
+                            issues,
+                            OptimizationCategory.Blendshape,
+                            OptimizationSeverity.Info,
+                            $"Skinned mesh '{renderer.name}' has {facialLikeBlendshapes.Count} facial-like blendshape(s)",
+                            "These appear to be expression or facial-related shapes and are likely CVR-sensitive. They should be reviewed carefully before any cleanup.",
+                            "Preserve facial-related blendshapes unless you have explicit confirmation that they are safe to remove.",
+                            false,
+                            renderer,
+                            $"BlendshapeFacial:{renderer.GetInstanceID()}");
+                    }
+                }
+
+                if (optimizer.blendshapeAnalysisSettings.removeZeroDeltaBlendshapes)
+                {
+                    var zeroDeltaBlendshapes = 0;
+                    for (int i = 0; i < blendshapeCount; i++)
+                    {
+                        if (IsZeroDeltaBlendshape(mesh, i))
+                        {
+                            zeroDeltaBlendshapes++;
+                        }
+                    }
+
+                    if (zeroDeltaBlendshapes > 0)
+                    {
+                        AddIssue(
+                            issues,
+                            OptimizationCategory.Blendshape,
+                            OptimizationSeverity.Warning,
+                            $"Skinned mesh '{renderer.name}' contains {zeroDeltaBlendshapes} likely empty blendshape(s)",
+                            "These shapes contribute little or no deformation and are good candidates for safe cleanup.",
+                            "Remove zero-delta blendshapes only after confirming they are not part of a facial or animation system.",
+                            true,
+                            renderer,
+                            $"BlendshapeZeroDelta:{renderer.GetInstanceID()}");
+                    }
+                }
+            }
+        }
+
+        private bool IsFacialLikeBlendshapeName(string blendshapeName)
+        {
+            if (string.IsNullOrWhiteSpace(blendshapeName))
+            {
+                return false;
+            }
+
+            var lowerName = blendshapeName.ToLowerInvariant();
+            return lowerName.Contains("blink")
+                || lowerName.Contains("viseme")
+                || lowerName.Contains("eye")
+                || lowerName.Contains("face")
+                || lowerName.Contains("mouth")
+                || lowerName.Contains("lip")
+                || lowerName.Contains("jaw")
+                || lowerName.Contains("cheek")
+                || lowerName.Contains("smile")
+                || lowerName.Contains("frown")
+                || lowerName.Contains("sad")
+                || lowerName.Contains("angry")
+                || lowerName.Contains("surprise")
+                || lowerName.Contains("kiss");
+        }
+
+        private void AnalyzePhysics(List<OptimizationIssue> issues)
+        {
+            var components = context.AvatarRootTransform.GetComponentsInChildren<Component>(true)
+                .Where(component => component != null)
+                .ToList();
+
+            var magicaComponents = components
+                .Where(component => component.GetType().Name.Contains("Magica", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (magicaComponents.Count > 0)
+            {
+                AddIssue(
+                    issues,
+                    OptimizationCategory.Physics,
+                    OptimizationSeverity.Warning,
+                    $"Detected {magicaComponents.Count} Magica-related component(s)",
+                    "Magica Cloth can be expensive depending on collision settings, proxy mesh size, and simulation frequency.",
+                    "Review collision settings and proxy mesh complexity for heavy cloth setups.",
+                    false,
+                    null,
+                    "MagicaComponents");
+            }
+
+            var colliders = context.AvatarRootTransform.GetComponentsInChildren<Collider>(true);
+            if (colliders.Length > 24)
+            {
+                AddIssue(
+                    issues,
+                    OptimizationCategory.Physics,
+                    OptimizationSeverity.Info,
+                    $"Detected {colliders.Length} colliders",
+                    "A large number of colliders can increase runtime cost, especially when paired with cloth or physics-driven components.",
+                    "Reduce unused colliders or consolidate them where possible.",
+                    false,
+                    null,
+                    "ColliderCount");
+            }
+
+            foreach (var component in components)
+            {
+                var typeName = component.GetType().Name;
+                var isMagicaLike = typeName.Contains("Magica", StringComparison.OrdinalIgnoreCase) || typeName.Contains("Cloth", StringComparison.OrdinalIgnoreCase);
+                var isDynamicBoneLike = typeName.Contains("DynamicBone", StringComparison.OrdinalIgnoreCase);
+
+                if (isMagicaLike)
+                {
+                    if (optimizer.physicsAnalysisSettings.warnOnMagicaSelfCollision)
+                    {
+                        var selfCollisionEnabled = TryReadBoolValue(component, "selfCollision", "selfCollisionEnabled", "useSelfCollision");
+                        if (selfCollisionEnabled)
+                        {
+                            AddIssue(
+                                issues,
+                                OptimizationCategory.Physics,
+                                OptimizationSeverity.Warning,
+                                $"{component.name} uses self-collision",
+                                "Magica self-collision adds runtime cost and can become expensive on dense cloth setups.",
+                                "Disable self-collision for less critical cloth objects or simplify the collision setup.",
+                                false,
+                                component,
+                                $"MagicaSelfCollision:{component.GetInstanceID()}");
+                        }
+                    }
+
+                    if (optimizer.physicsAnalysisSettings.warnOnMagicaMutualCollision)
+                    {
+                        var mutualCollisionEnabled = TryReadBoolValue(component, "mutualCollision", "mutualCollisionEnabled", "useMutualCollision", "allowMutualCollision");
+                        if (mutualCollisionEnabled)
+                        {
+                            AddIssue(
+                                issues,
+                                OptimizationCategory.Physics,
+                                OptimizationSeverity.Warning,
+                                $"{component.name} uses mutual collision",
+                                "Magica mutual collision can significantly increase the cost of cloth simulation.",
+                                "Reduce the number of colliding cloth objects or disable mutual collision where not required.",
+                                false,
+                                component,
+                                $"MagicaMutualCollision:{component.GetInstanceID()}");
+                        }
+                    }
+
+                    if (optimizer.physicsAnalysisSettings.warnOnHighProxyVertexCount)
+                    {
+                        var proxyVertexCount = TryReadMeshVertexCount(component, "proxyMesh", "mesh", "sourceMesh");
+                        if (proxyVertexCount > optimizer.physicsAnalysisSettings.maxRecommendedProxyVertexCount)
+                        {
+                            AddIssue(
+                                issues,
+                                OptimizationCategory.Physics,
+                                OptimizationSeverity.Warning,
+                                $"{component.name} uses a large proxy mesh ({proxyVertexCount} vertices)",
+                                "Large proxy meshes increase cloth simulation cost and can become a bottleneck during optimization.",
+                                "Reduce the proxy mesh density or use a simplified mesh for cloth simulation.",
+                                false,
+                                component,
+                                $"MagicaProxyMesh:{component.GetInstanceID()}");
+                        }
+                    }
+                }
+
+                if (isDynamicBoneLike && optimizer.physicsAnalysisSettings.warnOnDynamicBoneComplexity)
+                {
+                    var colliderCount = TryReadCollectionCount(component, "m_Colliders", "colliders", "m_ColliderList", "colliderList");
+                    if (colliderCount > optimizer.physicsAnalysisSettings.maxRecommendedDynamicBoneColliders)
+                    {
+                        AddIssue(
+                            issues,
+                            OptimizationCategory.Physics,
+                            OptimizationSeverity.Info,
+                            $"{component.name} uses {colliderCount} Dynamic Bone colliders",
+                            "Dynamic Bone setups with many colliders can increase runtime complexity and become more sensitive to bone or mesh changes.",
+                            "Reduce redundant colliders or simplify the Dynamic Bone setup where possible.",
+                            false,
+                            component,
+                            $"DynamicBoneColliders:{component.GetInstanceID()}");
+                    }
+                }
+
+                if (optimizer.physicsAnalysisSettings.warnOnHighSimulationFrequency)
+                {
+                    var frequency = TryReadIntValue(component, "frequency", "simulationFrequency", "simFrequency", "updateFrequency");
+                    if (frequency > optimizer.physicsAnalysisSettings.maxRecommendedSimulationFrequency)
+                    {
+                        AddIssue(
+                            issues,
+                            OptimizationCategory.Physics,
+                            OptimizationSeverity.Warning,
+                            $"{component.name} uses a high simulation frequency",
+                            "High cloth simulation frequency can significantly increase CPU cost.",
+                            "Reduce the simulation frequency or use a lower-cost setup for less critical cloth objects.",
+                            false,
+                            component,
+                            $"ClothFrequency:{component.GetInstanceID()}");
+                    }
+                }
+            }
+        }
+
+        private bool TryReadBoolValue(Component component, params string[] candidateNames)
+        {
+            if (component == null) return false;
+
+            var type = component.GetType();
+            foreach (var name in candidateNames)
+            {
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (field != null)
+                {
+                    var value = field.GetValue(component);
+                    if (value is bool boolValue)
+                    {
+                        return boolValue;
+                    }
+                }
+
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (property != null && property.PropertyType == typeof(bool))
+                {
+                    try
+                    {
+                        return (bool)property.GetValue(component);
+                    }
+                    catch (Exception)
+                    {
+                        // Ignore reflection access exceptions and continue scanning other candidates.
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private int TryReadIntValue(Component component, params string[] candidateNames)
+        {
+            if (component == null) return 0;
+
+            var type = component.GetType();
+            foreach (var name in candidateNames)
+            {
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (field != null)
+                {
+                    var value = field.GetValue(component);
+                    if (value is int intValue)
+                    {
+                        return intValue;
+                    }
+                    if (value is float floatValue)
+                    {
+                        return Mathf.RoundToInt(floatValue);
+                    }
+                }
+
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (property != null)
+                {
+                    try
+                    {
+                        var value = property.GetValue(component);
+                        if (value is int intValue)
+                        {
+                            return intValue;
+                        }
+                        if (value is float floatValue)
+                        {
+                            return Mathf.RoundToInt(floatValue);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // Ignore reflection access exceptions and continue scanning other candidates.
+                    }
+                }
+            }
+
+            return 0;
+        }
+
+        private int TryReadMeshVertexCount(Component component, params string[] candidateNames)
+        {
+            if (component == null) return 0;
+
+            var type = component.GetType();
+            foreach (var name in candidateNames)
+            {
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (field != null)
+                {
+                    var value = field.GetValue(component);
+                    switch (value)
+                    {
+                        case Mesh mesh:
+                            return mesh.vertexCount;
+                        case SkinnedMeshRenderer skinned:
+                            return skinned.sharedMesh != null ? skinned.sharedMesh.vertexCount : 0;
+                        case MeshFilter meshFilter:
+                            return meshFilter.sharedMesh != null ? meshFilter.sharedMesh.vertexCount : 0;
+                    }
+                }
+
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (property != null)
+                {
+                    try
+                    {
+                        var value = property.GetValue(component);
+                        switch (value)
+                        {
+                            case Mesh mesh:
+                                return mesh.vertexCount;
+                            case SkinnedMeshRenderer skinned:
+                                return skinned.sharedMesh != null ? skinned.sharedMesh.vertexCount : 0;
+                            case MeshFilter meshFilter:
+                                return meshFilter.sharedMesh != null ? meshFilter.sharedMesh.vertexCount : 0;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // Ignore reflection access exceptions and continue scanning other candidates.
+                    }
+                }
+            }
+
+            return 0;
+        }
+
+        private int TryReadCollectionCount(Component component, params string[] candidateNames)
+        {
+            if (component == null) return 0;
+
+            var type = component.GetType();
+            foreach (var name in candidateNames)
+            {
+                var field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (field != null)
+                {
+                    var value = field.GetValue(component);
+                    if (value is System.Collections.IEnumerable enumerable && value is not string)
+                    {
+                        return enumerable.Cast<object?>().Count(item => item != null);
+                    }
+                }
+
+                var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (property != null)
+                {
+                    try
+                    {
+                        var value = property.GetValue(component);
+                        if (value is System.Collections.IEnumerable enumerable && value is not string)
+                        {
+                            return enumerable.Cast<object?>().Count(item => item != null);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // Ignore reflection access exceptions and continue scanning other candidates.
+                    }
+                }
+            }
+
+            return 0;
+        }
+
+        private void RefreshIssuesAfterOptimization()
+        {
+            var currentIssues = new List<OptimizationIssue>();
+            AnalyzeAvatarState(currentIssues);
+
+            var mergedIssues = new List<OptimizationIssue>();
+            foreach (var currentIssue in currentIssues)
+            {
+                var previousIssue = optimizationIssues.FirstOrDefault(previous => string.Equals(previous.IssueKey, currentIssue.IssueKey, StringComparison.Ordinal));
+                if (previousIssue != null)
+                {
+                    currentIssue.BeforeValue = previousIssue.BeforeValue ?? GetIssueBeforeValue(previousIssue);
+                    currentIssue.AfterValue = GetIssueAfterValue(currentIssue);
+                    ApplyBeforeAfterTitle(currentIssue);
+
+                    if (currentIssue.BeforeValue.HasValue && currentIssue.AfterValue.HasValue && currentIssue.BeforeValue.Value == currentIssue.AfterValue.Value)
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    currentIssue.AfterValue = GetIssueAfterValue(currentIssue);
+                    ApplyBeforeAfterTitle(currentIssue);
+                }
+
+                mergedIssues.Add(currentIssue);
+            }
+
+            optimizationIssues.Clear();
+            optimizationIssues.AddRange(mergedIssues);
+        }
+
+        private int? GetIssueBeforeValue(OptimizationIssue issue)
+        {
+            if (issue.BeforeValue.HasValue)
+            {
+                return issue.BeforeValue.Value;
+            }
+
+            if (issue.Category == OptimizationCategory.Blendshape && issue.TargetComponent is SkinnedMeshRenderer renderer)
+            {
+                return renderer.sharedMesh != null ? renderer.sharedMesh.blendShapeCount : 0;
+            }
+
+            return null;
+        }
+
+        private int? GetIssueAfterValue(OptimizationIssue issue)
+        {
+            switch (issue.Category)
+            {
+                case OptimizationCategory.Blendshape when issue.TargetComponent is SkinnedMeshRenderer renderer:
+                    return renderer.sharedMesh != null ? renderer.sharedMesh.blendShapeCount : 0;
+                case OptimizationCategory.Mesh:
+                    return context.AvatarRootTransform.GetComponentsInChildren<Renderer>(true).Length;
+                case OptimizationCategory.Material:
+                    if (issue.IssueKey == "MaterialSlotCount")
+                    {
+                        return context.AvatarRootTransform.GetComponentsInChildren<Renderer>(true)
+                            .Sum(renderer => renderer.sharedMaterials?.Count(mat => mat != null) ?? 0);
+                    }
+                    return null;
+                case OptimizationCategory.Animator:
+                    if (issue.Title.Contains("layers", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return GetAvatarAnimatorControllers()
+                            .OfType<AnimatorController>()
+                            .Select(controller => controller.layers.Length)
+                            .FirstOrDefault();
+                    }
+                    if (issue.Title.Contains("parameters", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return GetAvatarAnimatorControllers()
+                            .OfType<AnimatorController>()
+                            .Select(controller => controller.parameters.Length)
+                            .FirstOrDefault();
+                    }
+                    break;
+                case OptimizationCategory.Physics:
+                    if (issue.IssueKey == "ColliderCount")
+                    {
+                        return context.AvatarRootTransform.GetComponentsInChildren<Collider>(true).Length;
+                    }
+                    break;
+            }
+
+            return null;
+        }
+
+        private void ApplyBeforeAfterTitle(OptimizationIssue issue)
+        {
+            if (!issue.BeforeValue.HasValue || !issue.AfterValue.HasValue || issue.BeforeValue.Value == issue.AfterValue.Value)
+            {
+                return;
+            }
+
+            if (issue.Category == OptimizationCategory.Blendshape && issue.TargetComponent is SkinnedMeshRenderer renderer)
+            {
+                issue.Title = $"Skinned mesh '{renderer.name}' used {issue.BeforeValue.Value} blendshapes and now uses {issue.AfterValue.Value}";
+                return;
+            }
+
+            if (issue.Title.Contains("uses", StringComparison.OrdinalIgnoreCase) || issue.Title.Contains("contains", StringComparison.OrdinalIgnoreCase))
+            {
+                issue.Title = $"{issue.Title} ({issue.BeforeValue.Value} → {issue.AfterValue.Value})";
+            }
+        }
+
+        private string BuildAnalysisReport()
+        {
+            if (optimizationIssues.Count == 0)
+            {
+                return "No optimization findings were detected.";
+            }
+
+            var report = new StringBuilder();
+            report.AppendLine("Optimization analysis summary:");
+
+            foreach (var category in Enum.GetValues(typeof(OptimizationCategory)).Cast<OptimizationCategory>())
+            {
+                var issues = optimizationIssues.Where(issue => issue.Category == category).ToList();
+                if (issues.Count == 0) continue;
+
+                report.AppendLine($"- {category}: {issues.Count} finding(s)");
+                foreach (var issue in issues.Take(optimizer.reportingSettings.maxIssuesPerCategory))
+                {
+                    report.AppendLine($"  • [{issue.Severity}] {issue.Title}");
+                    report.AppendLine($"    {issue.SuggestedAction}");
+                }
+            }
+
+            return report.ToString();
+        }
+
+        private void AddIssue(List<OptimizationIssue> issues, OptimizationCategory category, OptimizationSeverity severity, string title, string description, string suggestedAction, bool canAutoFix, Component targetComponent, string issueKey = null)
+        {
+            issues.Add(new OptimizationIssue
+            {
+                Category = category,
+                Severity = severity,
+                Title = title,
+                Description = description,
+                SuggestedAction = suggestedAction,
+                CanAutoFix = canAutoFix,
+                TargetComponent = targetComponent,
+                IssueKey = issueKey
+            });
+        }
+
+        private void AddIssue(OptimizationCategory category, OptimizationSeverity severity, string title, string description, string suggestedAction, bool canAutoFix, Component targetComponent)
+        {
+            AddIssue(optimizationIssues, category, severity, title, description, suggestedAction, canAutoFix, targetComponent);
+        }
+
         public void Process()
         {
             var startTime = Time.realtimeSinceStartup;
@@ -493,6 +1366,15 @@ namespace MilchZocker.AvatarOptimizer
 
             try
             {
+                AnalyzeAvatar();
+
+                if (optimizer.reportOnly)
+                {
+                    LogBuffered("[AvatarOptimizer] Report-only mode enabled; skipping destructive optimization steps");
+                    FlushBufferedLog();
+                    return;
+                }
+
                 if (optimizer.boneSettings.preserveAnimatedBones)
                 {
                     LogBuffered("[AvatarOptimizer] Preserve animated bones ON");
@@ -588,6 +1470,9 @@ namespace MilchZocker.AvatarOptimizer
                 // Try to apply any pending atlas import settings whose atlases are now saved to the AssetDatabase
                 ApplyPendingAtlasImportSettings();
 
+                RefreshIssuesAfterOptimization();
+                optimizer.stats.lastAnalysisReport = BuildAnalysisReport();
+
                 // Rebuild MagicaCloth simulations after mesh/bone modifications
                 LogBuffered("[AvatarOptimizer] Rebuilding MagicaCloth simulations...");
                 PushLogIndent();
@@ -595,10 +1480,10 @@ namespace MilchZocker.AvatarOptimizer
                 PopLogIndent();
 
                 LogBuffered($"[AvatarOptimizer] ========== Optimization Complete in {optimizer.stats.optimizationTimeSeconds:F2}s ==========");
-                LogBuffered($"[AvatarOptimizer] Stats: {optimizer.stats.bonesRemoved} bones, {optimizer.stats.boneReferencesRemoved} bone refs, " +
-                            $"{optimizer.stats.blendshapesRemoved} blendshapes, {optimizer.stats.verticesMerged} vertices merged, " +
-                            $"{optimizer.stats.looseVerticesRemoved} loose vertices, {optimizer.stats.meshesCombined} meshes combined, " +
-                            $"{optimizer.stats.atlasesGenerated} atlases");
+                LogBuffered($"[AvatarOptimizer] Stats: {optimizer.stats.bonesRemoved} bone objects removed, {optimizer.stats.boneReferencesRemoved} bone references removed, " +
+                            $"{optimizer.stats.blendshapesRemoved} blendshapes removed, {optimizer.stats.verticesMerged} vertices merged, " +
+                            $"{optimizer.stats.looseVerticesRemoved} loose vertices removed, {optimizer.stats.meshesCombined} meshes combined, " +
+                            $"{optimizer.stats.meshesModified} meshes modified, {optimizer.stats.atlasesGenerated} atlases");
 
                 FlushBufferedLog();
             }
@@ -809,30 +1694,9 @@ namespace MilchZocker.AvatarOptimizer
             LogBuffered("[AvatarOptimizer] Collecting animated bones...");
             PushLogIndent();
 
-            var overrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatar, "overrides");
-            if (overrides != null)
+            foreach (var controller in GetAvatarAnimatorControllers())
             {
-                CollectAnimatedBonesFromController(overrides);
-            }
-
-            var avatarUsesAdvancedSettings = GetFieldOrPropertyValue<bool>(avatar, "avatarUsesAdvancedSettings");
-            if (avatarUsesAdvancedSettings)
-            {
-                var avatarSettings = GetFieldOrPropertyValue<object>(avatar, "avatarSettings");
-                if (avatarSettings != null)
-                {
-                    var animator = GetFieldOrPropertyValue<AnimatorController>(avatarSettings, "animator");
-                    if (animator != null)
-                    {
-                        CollectAnimatedBonesFromController(animator);
-                    }
-
-                    var baseController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseController");
-                    if (baseController != null)
-                    {
-                        CollectAnimatedBonesFromController(baseController);
-                    }
-                }
+                CollectAnimatedBonesFromController(controller);
             }
 
             PopLogIndent();
@@ -866,30 +1730,9 @@ namespace MilchZocker.AvatarOptimizer
             LogBuffered("[AvatarOptimizer] Collecting animated transform properties...");
             PushLogIndent();
 
-            var overrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatar, "overrides");
-            if (overrides != null)
+            foreach (var controller in GetAvatarAnimatorControllers())
             {
-                CollectAnimatedTransformPropertiesFromController(overrides);
-            }
-
-            var avatarUsesAdvancedSettings = GetFieldOrPropertyValue<bool>(avatar, "avatarUsesAdvancedSettings");
-            if (avatarUsesAdvancedSettings)
-            {
-                var avatarSettings = GetFieldOrPropertyValue<object>(avatar, "avatarSettings");
-                if (avatarSettings != null)
-                {
-                    var animator = GetFieldOrPropertyValue<AnimatorController>(avatarSettings, "animator");
-                    if (animator != null)
-                    {
-                        CollectAnimatedTransformPropertiesFromController(animator);
-                    }
-
-                    var baseController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseController");
-                    if (baseController != null)
-                    {
-                        CollectAnimatedTransformPropertiesFromController(baseController);
-                    }
-                }
+                CollectAnimatedTransformPropertiesFromController(controller);
             }
 
             PopLogIndent();
@@ -1043,37 +1886,17 @@ namespace MilchZocker.AvatarOptimizer
 
             if (settings.scanAdvancedAvatarSettings && avatar != null)
             {
-                var avatarUsesAdvancedSettings = GetFieldOrPropertyValue<bool>(avatar, "avatarUsesAdvancedSettings");
-                if (avatarUsesAdvancedSettings)
+                foreach (var controller in GetAvatarAnimatorControllers())
                 {
-                    var avatarSettings = GetFieldOrPropertyValue<object>(avatar, "avatarSettings");
-                    if (avatarSettings != null)
-                    {
-                        var animator = GetFieldOrPropertyValue<AnimatorController>(avatarSettings, "animator");
-                        if (animator != null)
-                        {
-                            CollectBlendshapesFromAnimator(animator);
-                        }
-
-                        var baseController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseController");
-                        if (baseController is AnimatorController baseAnimator)
-                        {
-                            CollectBlendshapesFromAnimator(baseAnimator);
-                        }
-                    }
+                    CollectBlendshapesFromAnimator(controller);
                 }
             }
 
             if (settings.scanOverrideController && avatar != null)
             {
-                var overrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatar, "overrides");
-                if (overrides is AnimatorController overrideController)
+                foreach (var controller in GetAvatarAnimatorControllers())
                 {
-                    CollectBlendshapesFromAnimator(overrideController);
-                }
-                else if (overrides is AnimatorOverrideController overrideCtrl)
-                {
-                    CollectBlendshapesFromAnimator(overrideCtrl);
+                    CollectBlendshapesFromAnimator(controller);
                 }
             }
 
@@ -1123,12 +1946,21 @@ namespace MilchZocker.AvatarOptimizer
             }
             else if (controller is AnimatorOverrideController overrideController)
             {
+                if (overrideController.runtimeAnimatorController is AnimatorController runtimeAnimatorController)
+                {
+                    foreach (var layer in runtimeAnimatorController.layers)
+                    {
+                        CollectClipsFromStateMachine(layer.stateMachine, clips);
+                    }
+                }
+
                 var overrides = new List<KeyValuePair<AnimationClip, AnimationClip>>();
                 overrideController.GetOverrides(overrides);
 
                 foreach (var pair in overrides)
                 {
                     if (pair.Value != null) clips.Add(pair.Value);
+                    else if (pair.Key != null) clips.Add(pair.Key);
                 }
             }
 
@@ -1821,6 +2653,7 @@ namespace MilchZocker.AvatarOptimizer
             var skinnedMeshRenderers = context.AvatarRootTransform.GetComponentsInChildren<SkinnedMeshRenderer>(true);
             int totalVerticesMerged = 0;
             int totalLooseRemoved = 0;
+            int modifiedMeshCount = 0;
 
             foreach (var smr in skinnedMeshRenderers)
             {
@@ -1831,25 +2664,23 @@ namespace MilchZocker.AvatarOptimizer
 
                 bool modified = false;
                 bool hasSkinnedData = mesh.boneWeights != null && mesh.boneWeights.Length > 0;
+                bool hasBlendShapes = mesh.blendShapeCount > 0;
 
                 if (settings.mergeVerticesByDistance)
                 {
-                    if (!hasSkinnedData)
-                    {
-                        int beforeCount = mesh.vertexCount;
-                        MergeVertices(mesh, settings);
-                        int merged = beforeCount - mesh.vertexCount;
-                        totalVerticesMerged += merged;
+                    int beforeCount = mesh.vertexCount;
+                    int merged = MergeVertices(mesh, settings, hasSkinnedData, hasBlendShapes);
+                    totalVerticesMerged += merged;
 
-                        if (merged > 0)
-                        {
-                            modified = true;
-                            LogBuffered($"[AvatarOptimizer] Merged {merged} vertices in {smr.name}");
-                        }
-                    }
-                    else
+                    if (merged > 0)
                     {
-                        LogBuffered($"[AvatarOptimizer] Skipping vertex merge for {smr.name} (skinned mesh - would cause crash)");
+                        modified = true;
+                        string mergeLabel = hasSkinnedData ? "merged safely" : "merged";
+                        LogBuffered($"[AvatarOptimizer] {mergeLabel} {merged} vertices in {smr.name}");
+                    }
+                    else if (hasBlendShapes)
+                    {
+                        LogBuffered($"[AvatarOptimizer] Applying conservative blendshape-safe cleanup to {smr.name}");
                     }
                 }
 
@@ -1861,7 +2692,8 @@ namespace MilchZocker.AvatarOptimizer
                     if (removed > 0)
                     {
                         modified = true;
-                        LogBuffered($"[AvatarOptimizer] Removed {removed} loose vertices in {smr.name}");
+                        string cleanupLabel = hasBlendShapes ? "removed" : "removed";
+                        LogBuffered($"[AvatarOptimizer] {cleanupLabel} {removed} loose vertices in {smr.name}");
                     }
                 }
 
@@ -1877,13 +2709,13 @@ namespace MilchZocker.AvatarOptimizer
                     modified = true;
                 }
 
-                if (settings.optimizeMeshForRendering)
+                if (settings.optimizeMeshForRendering && !hasSkinnedData && !hasBlendShapes)
                 {
                     mesh.Optimize();
                     modified = true;
                 }
 
-                if (settings.applyMeshCompression)
+                if (settings.applyMeshCompression && !hasSkinnedData && !hasBlendShapes)
                 {
                     ModelImporterMeshCompression compressionLevel = settings.compressionLevel switch
                     {
@@ -1895,6 +2727,11 @@ namespace MilchZocker.AvatarOptimizer
 
                     MeshUtility.SetMeshCompression(mesh, compressionLevel);
                     modified = true;
+                }
+
+                if (modified)
+                {
+                    modifiedMeshCount++;
                 }
 
                 if (modified && !hasSkinnedData)
@@ -1914,13 +2751,22 @@ namespace MilchZocker.AvatarOptimizer
 
             optimizer.stats.verticesMerged = totalVerticesMerged;
             optimizer.stats.looseVerticesRemoved = totalLooseRemoved;
+            optimizer.stats.meshesModified = modifiedMeshCount;
 
             PopLogIndent();
             LogBuffered("[AvatarOptimizer] --- OptimizeMeshes END ---");
+            LogBuffered($"[AvatarOptimizer] Mesh optimization summary: {totalVerticesMerged} vertices merged, {totalLooseRemoved} loose vertices removed across {modifiedMeshCount} meshes");
         }
 
-        private void MergeVertices(Mesh mesh, AvatarOptimizer.MeshOptimizationSettings settings)
+        private int MergeVertices(Mesh mesh, AvatarOptimizer.MeshOptimizationSettings settings, bool hasSkinnedData, bool hasBlendShapes)
         {
+            if (mesh == null) return 0;
+
+            if (hasBlendShapes)
+            {
+                return 0;
+            }
+
             var vertices = mesh.vertices;
             var normals = mesh.normals;
             var tangents = mesh.tangents;
@@ -1939,6 +2785,7 @@ namespace MilchZocker.AvatarOptimizer
             float distanceSq = settings.mergeDistance * settings.mergeDistance;
             float normalThreshold = Mathf.Cos(settings.normalAngleThreshold * Mathf.Deg2Rad);
             float uvDistanceSq = settings.uvDistanceThreshold * settings.uvDistanceThreshold;
+            const float boneWeightTolerance = 0.001f;
 
             for (int i = 0; i < vertices.Length; i++)
             {
@@ -1962,6 +2809,12 @@ namespace MilchZocker.AvatarOptimizer
                             continue;
                     }
 
+                    if (hasSkinnedData && boneWeights.Length > i && newBoneWeights.Count > j)
+                    {
+                        if (!HasCompatibleBoneWeights(boneWeights[i], newBoneWeights[j], boneWeightTolerance))
+                            continue;
+                    }
+
                     vertexMap[i] = j;
                     merged = true;
                     break;
@@ -1979,6 +2832,9 @@ namespace MilchZocker.AvatarOptimizer
                 }
             }
 
+            if (newVertices.Count == vertices.Length)
+                return 0;
+
             for (int i = 0; i < mesh.subMeshCount; i++)
             {
                 var triangles = mesh.GetTriangles(i);
@@ -1989,12 +2845,32 @@ namespace MilchZocker.AvatarOptimizer
                 mesh.SetTriangles(triangles, i);
             }
 
-            mesh.vertices = newVertices.ToArray();
-            if (newNormals.Count > 0) mesh.normals = newNormals.ToArray();
-            if (newTangents.Count > 0) mesh.tangents = newTangents.ToArray();
-            if (newUV.Count > 0) mesh.uv = newUV.ToArray();
-            if (newColors.Count > 0) mesh.colors = newColors.ToArray();
+            mesh.SetVertices(newVertices);
+            if (newNormals.Count > 0) mesh.SetNormals(newNormals);
+            if (newTangents.Count > 0) mesh.SetTangents(newTangents);
+            if (newUV.Count > 0) mesh.SetUVs(0, newUV);
+            if (newColors.Count > 0) mesh.SetColors(newColors);
             if (newBoneWeights.Count > 0) mesh.boneWeights = newBoneWeights.ToArray();
+
+            mesh.RecalculateBounds();
+            if (mesh.vertexCount > 0 && mesh.normals.Length != mesh.vertexCount)
+            {
+                mesh.RecalculateNormals();
+            }
+
+            return vertices.Length - newVertices.Count;
+        }
+
+        private bool HasCompatibleBoneWeights(BoneWeight a, BoneWeight b, float tolerance)
+        {
+            return a.boneIndex0 == b.boneIndex0
+                && a.boneIndex1 == b.boneIndex1
+                && a.boneIndex2 == b.boneIndex2
+                && a.boneIndex3 == b.boneIndex3
+                && Mathf.Abs(a.weight0 - b.weight0) <= tolerance
+                && Mathf.Abs(a.weight1 - b.weight1) <= tolerance
+                && Mathf.Abs(a.weight2 - b.weight2) <= tolerance
+                && Mathf.Abs(a.weight3 - b.weight3) <= tolerance;
         }
 
         private int RemoveLooseVertices(Mesh mesh)
@@ -2029,6 +2905,27 @@ namespace MilchZocker.AvatarOptimizer
                 var newColors = new List<Color>();
                 var newBoneWeights = new List<BoneWeight>();
 
+                var blendShapeFrames = new List<(string name, float weight, Vector3[] deltaVertices, Vector3[] deltaNormals, Vector3[] deltaTangents)>();
+
+                if (mesh.blendShapeCount > 0)
+                {
+                    for (int shapeIndex = 0; shapeIndex < mesh.blendShapeCount; shapeIndex++)
+                    {
+                        string shapeName = mesh.GetBlendShapeName(shapeIndex);
+                        int frameCount = mesh.GetBlendShapeFrameCount(shapeIndex);
+                        for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
+                        {
+                            var deltaVertices = new Vector3[mesh.vertexCount];
+                            var deltaNormals = new Vector3[mesh.vertexCount];
+                            var deltaTangents = new Vector3[mesh.vertexCount];
+                            mesh.GetBlendShapeFrameVertices(shapeIndex, frameIndex, deltaVertices, deltaNormals, deltaTangents);
+                            float frameWeight = mesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
+
+                            blendShapeFrames.Add((shapeName, frameWeight, deltaVertices, deltaNormals, deltaTangents));
+                        }
+                    }
+                }
+
                 for (int i = 0; i < vertices.Length; i++)
                 {
                     if (usedVertices.Contains(i))
@@ -2043,22 +2940,72 @@ namespace MilchZocker.AvatarOptimizer
                     }
                 }
 
-                for (int i = 0; i < mesh.subMeshCount; i++)
+                var subMeshTriangles = new List<int[]>();
+                int subMeshCount = mesh.subMeshCount;
+                for (int i = 0; i < subMeshCount; i++)
                 {
                     var triangles = mesh.GetTriangles(i);
                     for (int j = 0; j < triangles.Length; j++)
                     {
                         triangles[j] = oldToNew[triangles[j]];
                     }
-                    mesh.SetTriangles(triangles, i);
+                    subMeshTriangles.Add(triangles);
                 }
 
-                mesh.vertices = newVertices.ToArray();
-                if (newNormals.Count > 0) mesh.normals = newNormals.ToArray();
-                if (newTangents.Count > 0) mesh.tangents = newTangents.ToArray();
-                if (newUV.Count > 0) mesh.uv = newUV.ToArray();
-                if (newColors.Count > 0) mesh.colors = newColors.ToArray();
+                var bindposes = mesh.bindposes;
+                mesh.Clear(false);
+                mesh.bindposes = bindposes;
+
+                mesh.SetVertices(newVertices);
+                if (newNormals.Count > 0) mesh.SetNormals(newNormals);
+                if (newTangents.Count > 0) mesh.SetTangents(newTangents);
+                if (newUV.Count > 0) mesh.SetUVs(0, newUV);
+                if (newColors.Count > 0) mesh.SetColors(newColors);
                 if (newBoneWeights.Count > 0) mesh.boneWeights = newBoneWeights.ToArray();
+
+                mesh.subMeshCount = subMeshCount;
+                for (int i = 0; i < subMeshCount; i++)
+                {
+                    mesh.SetTriangles(subMeshTriangles[i], i);
+                }
+
+                if (mesh.blendShapeCount > 0)
+                {
+                    mesh.Clear(false);
+                    mesh.bindposes = bindposes;
+                    mesh.SetVertices(newVertices);
+                    if (newNormals.Count > 0) mesh.SetNormals(newNormals);
+                    if (newTangents.Count > 0) mesh.SetTangents(newTangents);
+                    if (newUV.Count > 0) mesh.SetUVs(0, newUV);
+                    if (newColors.Count > 0) mesh.SetColors(newColors);
+                    if (newBoneWeights.Count > 0) mesh.boneWeights = newBoneWeights.ToArray();
+
+                    mesh.subMeshCount = subMeshCount;
+                    for (int i = 0; i < subMeshCount; i++)
+                    {
+                        mesh.SetTriangles(subMeshTriangles[i], i);
+                    }
+
+                    foreach (var frame in blendShapeFrames)
+                    {
+                        var newDeltaVertices = new Vector3[newVertices.Count];
+                        var newDeltaNormals = new Vector3[newVertices.Count];
+                        var newDeltaTangents = new Vector3[newVertices.Count];
+
+                        for (int vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+                        {
+                            if (usedVertices.Contains(vertexIndex))
+                            {
+                                int targetIndex = oldToNew[vertexIndex];
+                                newDeltaVertices[targetIndex] = frame.deltaVertices[vertexIndex];
+                                newDeltaNormals[targetIndex] = frame.deltaNormals[vertexIndex];
+                                newDeltaTangents[targetIndex] = frame.deltaTangents[vertexIndex];
+                            }
+                        }
+
+                        mesh.AddBlendShapeFrame(frame.name, frame.weight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
+                    }
+                }
             }
 
             return removed;
@@ -2074,7 +3021,24 @@ namespace MilchZocker.AvatarOptimizer
             LogBuffered("[AvatarOptimizer] --- CombineMeshes START ---");
             PushLogIndent();
 
+            if (!optimizer.meshSettings.combineMeshes)
+            {
+                LogBuffered("[AvatarOptimizer] Mesh combining is disabled in settings; skipping");
+                optimizer.stats.meshesCombined = 0;
+                PopLogIndent();
+                LogBuffered("[AvatarOptimizer] --- CombineMeshes END ---");
+                return;
+            }
+
             var skinnedMeshRenderers = context.AvatarRootTransform.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            if (skinnedMeshRenderers == null || skinnedMeshRenderers.Length == 0)
+            {
+                LogBuffered("[AvatarOptimizer] No skinned mesh renderers found for combine pass");
+                optimizer.stats.meshesCombined = 0;
+                PopLogIndent();
+                LogBuffered("[AvatarOptimizer] --- CombineMeshes END ---");
+                return;
+            }
 
             var combinableGroups = GroupCombinableMeshes(skinnedMeshRenderers);
 
@@ -2140,10 +3104,25 @@ namespace MilchZocker.AvatarOptimizer
 
         private bool CanCombineMesh(SkinnedMeshRenderer smr)
         {
+            if (smr == null || smr.sharedMesh == null || smr.bones == null || smr.bones.Length == 0)
+            {
+                return false;
+            }
+
+            if (optimizer.meshSettings.excludeFaceMeshFromCombine && IsCVRFaceMesh(smr))
+            {
+                return false;
+            }
+
+            if (smr.sharedMesh.blendShapeCount > 0)
+            {
+                return false;
+            }
+
             if (animatedTransformProperties.ContainsKey(smr.transform))
             {
                 var props = animatedTransformProperties[smr.transform];
-                if (props.Any(p => !p.StartsWith("blendShape.")))
+                if (props.Any(p => p.Contains("material.", StringComparison.OrdinalIgnoreCase) || p.Contains("m_Materials", StringComparison.OrdinalIgnoreCase)))
                 {
                     return false;
                 }
@@ -2154,6 +3133,9 @@ namespace MilchZocker.AvatarOptimizer
 
         private bool CanCombineTogether(SkinnedMeshRenderer smr1, SkinnedMeshRenderer smr2)
         {
+            if (smr1 == null || smr2 == null)
+                return false;
+
             if (smr1.sharedMaterials.Length != smr2.sharedMaterials.Length)
                 return false;
 
@@ -2166,7 +3148,47 @@ namespace MilchZocker.AvatarOptimizer
             if (smr1.rootBone != smr2.rootBone)
                 return false;
 
+            if (!HaveSameBoneSet(smr1, smr2))
+                return false;
+
+            var animatedProps1 = animatedTransformProperties.GetValueOrDefault(smr1.transform);
+            var animatedProps2 = animatedTransformProperties.GetValueOrDefault(smr2.transform);
+            if (animatedProps1 != null && animatedProps2 != null)
+            {
+                var sharedAnimatedProps = animatedProps1.Intersect(animatedProps2, StringComparer.OrdinalIgnoreCase).ToList();
+                if (sharedAnimatedProps.Count > 0 && sharedAnimatedProps.Any(p => p.Contains("material.", StringComparison.OrdinalIgnoreCase) || p.Contains("m_Materials", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return false;
+                }
+            }
+
             return true;
+        }
+
+        private bool HaveSameBoneSet(SkinnedMeshRenderer smr1, SkinnedMeshRenderer smr2)
+        {
+            if (smr1.bones == null || smr2.bones == null)
+                return false;
+
+            if (smr1.bones.Length != smr2.bones.Length)
+                return false;
+
+            for (int i = 0; i < smr1.bones.Length; i++)
+            {
+                if (smr1.bones[i] != smr2.bones[i])
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool IsCVRFaceMesh(SkinnedMeshRenderer smr)
+        {
+            if (smr == null) return false;
+            if (avatar == null) return false;
+
+            var faceMesh = GetFieldOrPropertyValue<SkinnedMeshRenderer>(avatar, "bodyMesh");
+            return faceMesh != null && faceMesh == smr;
         }
 
         private void CombineMeshGroup(List<SkinnedMeshRenderer> group)
@@ -2201,7 +3223,7 @@ namespace MilchZocker.AvatarOptimizer
                 if (smr.sharedMesh == null) continue;
 
                 var mesh = smr.sharedMesh;
-                var localToWorld = smr.transform.localToWorldMatrix;
+                var localToWorld = firstRenderer.transform.worldToLocalMatrix * smr.transform.localToWorldMatrix;
 
                 var boneWeights = mesh.boneWeights;
                 var remappedWeights = new BoneWeight[boneWeights.Length];
@@ -2246,10 +3268,100 @@ namespace MilchZocker.AvatarOptimizer
             firstRenderer.bones = allBones.ToArray();
             firstRenderer.rootBone = firstRenderer.rootBone;
 
+            if (optimizer.meshSettings.combineMeshes)
+            {
+                RecreateAnimationBindingsForCombinedMesh(group, firstRenderer);
+            }
+
             for (int i = 1; i < group.Count; i++)
             {
-                group[i].gameObject.SetActive(false);
+                group[i].gameObject.SetActive(true);
             }
+        }
+
+        private void RecreateAnimationBindingsForCombinedMesh(List<SkinnedMeshRenderer> group, SkinnedMeshRenderer firstRenderer)
+        {
+            if (avatar == null) return;
+
+            foreach (var controller in GetAvatarAnimatorControllers())
+            {
+                if (controller is not AnimatorOverrideController overrideController)
+                {
+                    continue;
+                }
+
+                var clipOverrides = new List<KeyValuePair<AnimationClip, AnimationClip>>();
+                overrideController.GetOverrides(clipOverrides);
+
+                foreach (var clipOverride in clipOverrides)
+                {
+                    var sourceClip = clipOverride.Value ?? clipOverride.Key;
+                    if (sourceClip == null) continue;
+
+                    var replacementClip = CreateReplacementClipForCombinedMesh(sourceClip, group, firstRenderer);
+                    if (replacementClip == null) continue;
+
+                    overrideController[clipOverride.Key] = replacementClip;
+                    EditorUtility.SetDirty(overrideController);
+                }
+            }
+        }
+
+        private AnimationClip CreateReplacementClipForCombinedMesh(AnimationClip sourceClip, List<SkinnedMeshRenderer> group, SkinnedMeshRenderer firstRenderer)
+        {
+            if (sourceClip == null) return null;
+
+            var replacementClip = new AnimationClip();
+            replacementClip.name = sourceClip.name + "_Optimized";
+            replacementClip.frameRate = sourceClip.frameRate;
+            replacementClip.wrapMode = sourceClip.wrapMode;
+
+            var bindings = AnimationUtility.GetCurveBindings(sourceClip);
+            foreach (var binding in bindings)
+            {
+                var curve = AnimationUtility.GetEditorCurve(sourceClip, binding);
+                if (curve == null) continue;
+
+                var newBinding = binding;
+                if (TryMapBindingToCombinedRenderer(binding.path, group, firstRenderer, out var mappedPath))
+                {
+                    newBinding.path = mappedPath;
+                }
+
+                AnimationUtility.SetEditorCurve(replacementClip, newBinding, curve);
+            }
+
+            var objectReferenceBindings = AnimationUtility.GetObjectReferenceCurveBindings(sourceClip);
+            foreach (var binding in objectReferenceBindings)
+            {
+                var curves = AnimationUtility.GetObjectReferenceCurve(sourceClip, binding);
+                if (curves == null) continue;
+
+                var newBinding = binding;
+                if (TryMapBindingToCombinedRenderer(binding.path, group, firstRenderer, out var mappedPath))
+                {
+                    newBinding.path = mappedPath;
+                }
+
+                AnimationUtility.SetObjectReferenceCurve(replacementClip, newBinding, curves);
+            }
+
+            return replacementClip;
+        }
+
+        private bool TryMapBindingToCombinedRenderer(string bindingPath, List<SkinnedMeshRenderer> group, SkinnedMeshRenderer firstRenderer, out string mappedPath)
+        {
+            mappedPath = bindingPath;
+            if (string.IsNullOrEmpty(bindingPath)) return false;
+
+            var sourceRenderer = context.AvatarRootTransform.Find(bindingPath)?.GetComponent<SkinnedMeshRenderer>();
+            if (sourceRenderer == null || !group.Contains(sourceRenderer))
+            {
+                return false;
+            }
+
+            mappedPath = GetTransformPath(firstRenderer.transform);
+            return true;
         }
 
         private int RemapBoneIndex(int originalIndex, SkinnedMeshRenderer smr, Dictionary<Transform, int> boneToIndex)
@@ -4339,35 +5451,11 @@ namespace MilchZocker.AvatarOptimizer
 
             var settings = optimizer.atlasSettings;
 
-            if (settings.scanOverrideController)
+            foreach (var controller in GetAvatarAnimatorControllers())
             {
-                var overrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatar, "overrides");
-                if (overrides != null)
+                if (settings.scanOverrideController || settings.scanAdvancedAvatarSettings)
                 {
-                    CollectAnimatedMaterialsFromController(overrides);
-                }
-            }
-
-            if (settings.scanAdvancedAvatarSettings)
-            {
-                var avatarUsesAdvancedSettings = GetFieldOrPropertyValue<bool>(avatar, "avatarUsesAdvancedSettings");
-                if (avatarUsesAdvancedSettings)
-                {
-                    var avatarSettings = GetFieldOrPropertyValue<object>(avatar, "avatarSettings");
-                    if (avatarSettings != null)
-                    {
-                        var animator = GetFieldOrPropertyValue<AnimatorController>(avatarSettings, "animator");
-                        if (animator != null)
-                        {
-                            CollectAnimatedMaterialsFromController(animator);
-                        }
-
-                        var baseController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseController");
-                        if (baseController != null)
-                        {
-                            CollectAnimatedMaterialsFromController(baseController);
-                        }
-                    }
+                    CollectAnimatedMaterialsFromController(controller);
                 }
             }
 
@@ -4387,6 +5475,58 @@ namespace MilchZocker.AvatarOptimizer
                         LogBuffered($"[AvatarOptimizer] Animated material: '{mat.name}'");
                     }
                 }
+            }
+        }
+
+        private IEnumerable<RuntimeAnimatorController> GetAvatarAnimatorControllers()
+        {
+            if (avatar == null)
+            {
+                yield break;
+            }
+
+            var seenControllers = new HashSet<RuntimeAnimatorController>();
+
+            var overrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatar, "overrides");
+            if (overrides != null && seenControllers.Add(overrides))
+            {
+                yield return overrides;
+            }
+
+            var avatarUsesAdvancedSettings = GetFieldOrPropertyValue<bool>(avatar, "avatarUsesAdvancedSettings");
+            if (!avatarUsesAdvancedSettings)
+            {
+                yield break;
+            }
+
+            var avatarSettings = GetFieldOrPropertyValue<object>(avatar, "avatarSettings");
+            if (avatarSettings == null)
+            {
+                yield break;
+            }
+
+            var animator = GetFieldOrPropertyValue<AnimatorController>(avatarSettings, "animator");
+            if (animator != null && seenControllers.Add(animator))
+            {
+                yield return animator;
+            }
+
+            var baseController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseController");
+            if (baseController != null && seenControllers.Add(baseController))
+            {
+                yield return baseController;
+            }
+
+            var baseOverrideController = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "baseOverrideController");
+            if (baseOverrideController != null && seenControllers.Add(baseOverrideController))
+            {
+                yield return baseOverrideController;
+            }
+
+            var avatarSettingsOverrides = GetFieldOrPropertyValue<RuntimeAnimatorController>(avatarSettings, "overrides");
+            if (avatarSettingsOverrides != null && seenControllers.Add(avatarSettingsOverrides))
+            {
+                yield return avatarSettingsOverrides;
             }
         }
 
