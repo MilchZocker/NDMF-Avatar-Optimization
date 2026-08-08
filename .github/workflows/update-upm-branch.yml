@@ -19,44 +19,9 @@ jobs:
         id: tag
         run: echo "name=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare package content for UPM branch export
-        run: |
-          python - <<'PY'
-          import hashlib
-          import shutil
-          from pathlib import Path
-
-          root = Path('.')
-          package_dir = root / 'packages' / 'NDMF-Avatar-Optimisation'
-          export_dir = root / '.tmp-upm-export'
-
-          if export_dir.exists():
-              shutil.rmtree(export_dir)
-          shutil.copytree(package_dir, export_dir)
-
-          def ensure_meta(path: Path):
-              if path.is_dir():
-                  for child in sorted(path.iterdir()):
-                      ensure_meta(child)
-                  return
-              if path.suffix == '.meta':
-                  return
-              meta_path = path.with_suffix(path.suffix + '.meta') if path.suffix else path.with_name(path.name + '.meta')
-              if meta_path.exists():
-                  return
-              guid = hashlib.md5(str(path.relative_to(export_dir)).encode('utf-8')).hexdigest()
-              meta_content = f'''fileFormatVersion: 2
-          guid: {guid}
-          '''
-              meta_path.write_text(meta_content, encoding='utf-8')
-
-          for child in sorted(export_dir.iterdir()):
-              ensure_meta(child)
-          PY
-
       - name: Create UPM Branch
         uses: hecomi/create-upm-branch-action@main
         with:
           git-tag: ${{ steps.tag.outputs.name }}
-          pkg-root-dir-path: .tmp-upm-export
+          pkg-root-dir-path: packages/NDMF-Avatar-Optimisation
           root-files: README.md LICENSE
