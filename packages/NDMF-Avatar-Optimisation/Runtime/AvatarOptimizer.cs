@@ -5,7 +5,7 @@ using UnityEngine.Serialization;
 
 namespace MilchZocker.AvatarOptimizer
 {
-    [AddComponentMenu("MilchZocker/Avatar Optimizer")]
+    [AddComponentMenu("NDMF Avatar Optimizer/Avatar Optimizer")]
     public class AvatarOptimizer : MonoBehaviour
     {
         [Header("=== Bone Optimisation ===")]
@@ -152,9 +152,6 @@ namespace MilchZocker.AvatarOptimizer
             public string meshNameExclude = "";
             
             [Space(10)]
-            [Tooltip("Strip unused mesh data (tangents, vertex colors, lightmap UVs)")]
-            public bool stripUnusedMeshData = true;
-            
             [Tooltip("Deduplicate identical materials to reduce draw calls")]
             public bool deduplicateMaterials = true;
 
@@ -164,10 +161,24 @@ namespace MilchZocker.AvatarOptimizer
             public bool optimizeIndexBuffer = false;
 
             [Tooltip("Merge identical submeshes that use the same material to reduce draw calls")]
-            public bool mergeIdenticalSubmeshes = false;
+            public bool mergeIdenticalSubmeshes = true;
 
-            [Tooltip("Intelligently strip vertex attributes based on shader usage (tangents, colors, uv2/3/4)")]
-            public bool intelligentAttributeStripping = false;
+            [Space(10)]
+            [Header("Attribute Stripping")]
+            [Tooltip("Enable intelligent stripping of unused vertex attributes based on shader requirements")]
+            public bool stripUnusedAttributes = true;
+
+            [Tooltip("Strip tangent data if not used by shader")]
+            public bool stripTangents = false;
+
+            [Tooltip("Strip vertex color data if not used by shader")]
+            public bool stripVertexColors = true;
+
+            [Tooltip("Strip lightmap UV coordinates if not used")]
+            public bool stripLightmapUVs = true;
+
+            [Tooltip("Strip unused UV channels (UV2, UV3, UV4) if not used by shader")]
+            public bool stripExtraUVChannels = true;
 
             [Tooltip("Log detailed information about mesh-level optimizations")]
             public bool verboseLogging = false;
@@ -243,7 +254,7 @@ namespace MilchZocker.AvatarOptimizer
             public bool useEnhancedAtlasWorkflow = false;
             
             [Tooltip("Merge materials using same textures by adjusting UV/padding (experimental)")]
-            public bool mergeIdenticalTextures = false;
+            public bool mergeIdenticalTextures = true;
             
             [Space(10)]
             [Header("Basic Atlas Settings")]
@@ -266,7 +277,7 @@ namespace MilchZocker.AvatarOptimizer
             [Space(10)]
             [Tooltip("Minimum output size for atlas textures. Set to 0 to use texture-derived sizes only. Higher values produce better quality but larger file sizes.")]
             [Range(0, 2048)]
-            public int minimumOutputAtlasSize = 512;
+            public int minimumOutputAtlasSize = 256;
             
             [Space(10)]
             [Header("Advanced Settings")]
@@ -278,7 +289,7 @@ namespace MilchZocker.AvatarOptimizer
             public string allowedTextureProperties = "*";
             
             [Tooltip("Exclude texture properties with these names (comma-separated, supports wildcards like *Shadow*)")]
-            public string excludedTextureProperties = "";
+            public string excludedTextureProperties = "_ReflectionCubeTex";
             
             [Tooltip("Minimum texture size to include in atlas (smaller textures will be skipped)")]
             [Range(16, 512)]
@@ -290,7 +301,7 @@ namespace MilchZocker.AvatarOptimizer
             public string allowedShaderNames = "";
             
             [Tooltip("Exclude materials using shaders with these names (comma-separated)")]
-            public string excludedShaderNames = "Hidden,UI,Unlit/Transparent";
+            public string excludedShaderNames = "";
             
             [Space(10)]
             [Header("═══════ Adaptive Compression Configuration ═══════")]
@@ -351,7 +362,7 @@ namespace MilchZocker.AvatarOptimizer
             
             [Tooltip("Reduce complexity for emission textures")]
             [Range(-0.5f, 0.5f)]
-            public float emissionTextureComplexityBoost = 0.05f;
+            public float emissionTextureComplexityBoost = -0.05f;
             
             [Space(10)]
             [Header("═══════ Texture Cache & Deduplication ═══════")]
@@ -397,7 +408,10 @@ namespace MilchZocker.AvatarOptimizer
             public bool addTimestampToName = false;
             
             [Tooltip("Add complexity tier to atlas filename")]
-            public bool includeTierInName = false;
+            public bool includeTierInName = true;
+            
+            [Tooltip("Include the complexity score in the atlas name (e.g., 'Atlas_0.85')")]
+            public bool includeComplexityScore = true;
             
             [Space(10)]
             [Header("═══════ Safety & Validation ═══════")]
@@ -405,10 +419,10 @@ namespace MilchZocker.AvatarOptimizer
             public bool validateUVBounds = true;
             
             [Tooltip("Warn if UV coordinates extend outside 0-1 range")]
-            public bool warnOnInvalidUVs = true;
+            public bool warnOnInvalidUVs = false;
             
             [Tooltip("Automatically fix out-of-bounds UVs by wrapping/clamping")]
-            public bool autoFixInvalidUVs = false;
+            public bool autoFixInvalidUVs = true;
             
             [Tooltip("Skip materials with invalid UVs instead of fixing them")]
             public bool skipInvalidUVMaterials = false;
@@ -416,7 +430,7 @@ namespace MilchZocker.AvatarOptimizer
             [Space(5)]
             [Tooltip("Maximum number of materials to combine in a single atlas")]
             [Range(2, 100)]
-            public int maxMaterialsPerAtlas = 50;
+            public int maxMaterialsPerAtlas = 5;
             
             [Tooltip("Skip atlasing if estimated atlas would exceed this pixel count")]
             public bool limitAtlasPixelCount = true;
@@ -427,14 +441,14 @@ namespace MilchZocker.AvatarOptimizer
             [Space(10)]
             [Header("═══════ Mip & Atlas Robustness ═══════")]
             [Tooltip("Use mip-aware padding to pick padding that is safe for mipmaps")]
-            public bool useMipAwarePadding = true;
+            public bool useMipAwarePadding = false;
             
             [Tooltip("Attempt to reduce fragmentation by iteratively repacking atlases")]
             public bool optimizeFragmentation = true;
             
             [Tooltip("Target minimum utilization before attempting size reduction (0.0-1.0)")]
             [Range(0.5f, 0.95f)]
-            public float targetUtilization = 0.85f;
+            public float targetUtilization = 0.9f;
             
             [Tooltip("Apply seam padding to atlases to avoid edge bleeding across UVs")]
             public bool padUVSeams = true;
@@ -447,7 +461,7 @@ namespace MilchZocker.AvatarOptimizer
             
             [Space(5)]
             [Tooltip("Apply texture filtering optimization based on content type")]
-            public bool optimizeFilterModes = true;
+            public bool optimizeFilterModes = false;
             
             [Tooltip("Filter mode for high-detail textures (albedo, normal)")]
             public FilterMode detailTextureFilter = FilterMode.Trilinear;
@@ -504,29 +518,20 @@ namespace MilchZocker.AvatarOptimizer
             
             [Tooltip("iOS platform compression format")]
             public UnityEditor.TextureImporterFormat iosFormat = UnityEditor.TextureImporterFormat.ASTC_6x6;
-#else
-            [HideInInspector]
-            public int standaloneFormat = 0;
-            
-            [HideInInspector]
-            public int androidFormat = 0;
-            
-            [HideInInspector]
-            public int iosFormat = 0;
 #endif
             
             [Space(10)]
             [Header("═══════ Advanced Quality Settings ═══════")]
             [Tooltip("Downscale textures that are significantly larger than others in the same atlas")]
-            public bool normalizeTextureSizes = false;
+            public bool normalizeTextureSizes = true;
             
             [Tooltip("Maximum size ratio between largest and smallest texture (2 = 2x difference allowed)")]
             [Range(1f, 8f)]
-            public float maxTextureSizeRatio = 4f;
+            public float maxTextureSizeRatio = 2f;
             
             [Space(5)]
             [Tooltip("Apply sharpening filter to downscaled textures")]
-            public bool sharpenDownscaledTextures = false;
+            public bool sharpenDownscaledTextures = true;
             
             [Tooltip("Sharpening strength (0-1)")]
             [Range(0f, 1f)]
@@ -576,9 +581,6 @@ namespace MilchZocker.AvatarOptimizer
 #if UNITY_EDITOR
             [Tooltip("Custom compression format")]
             public UnityEditor.TextureImporterFormat customFormat = UnityEditor.TextureImporterFormat.Automatic;
-#else
-            [HideInInspector]
-            public int customFormat = 0;
 #endif
             
             [Tooltip("Anisotropic filtering level (0 = disabled, 16 = max)")]

@@ -32,6 +32,11 @@ namespace MilchZocker.AvatarOptimizer
         private readonly Dictionary<string, Texture2D> textureCache = new Dictionary<string, Texture2D>();
         private readonly Dictionary<Texture2D, string> textureFingerprintCache = new Dictionary<Texture2D, string>();
 
+        // Texture memory tracking
+        private readonly Dictionary<Texture2D, long> originalTextureMemory = new Dictionary<Texture2D, long>();
+        private readonly HashSet<Texture2D> accountedAtlases = new HashSet<Texture2D>();
+        private long totalAtlasMemoryBytes = 0;
+
         // Memory estimation struct
         public struct MemoryEstimate
         {
@@ -42,8 +47,35 @@ namespace MilchZocker.AvatarOptimizer
             public int textureCount;
         }
 
+        /// <summary>
+        /// Holds analysis results for material atlasing compatibility
+        /// </summary>
+        public class MaterialAtlasAnalysis
+        {
+            public class MaterialInfo
+            {
+                public Material material;
+                public string shaderName;
+                public bool canAtlas;
+                public List<string> reasons = new List<string>();
+                public List<string> compatibleProperties = new List<string>();
+                public List<string> incompatibleProperties = new List<string>();
+                public int groupId = -1;  // Which atlas group this belongs to
+                public List<Material> canAtlasWith = new List<Material>();
+            }
+
+            public List<MaterialInfo> materials = new List<MaterialInfo>();
+            public Dictionary<string, List<MaterialInfo>> materialsByShader = new Dictionary<string, List<MaterialInfo>>();
+            public List<List<MaterialInfo>> atlasGroups = new List<List<MaterialInfo>>();
+            public int totalMaterials = 0;
+            public int atlaseableMaterials = 0;
+            public int excludedMaterials = 0;
+        }
+
         private Type cvrAvatarType;
         private Type cvrFaceTrackingType;
+
+        private MaterialAtlasAnalysis atlasAnalysis;
 
         // ===== Buffered logging (chunked final log) =====
         private readonly StringBuilder logBuffer = new StringBuilder(8192);
@@ -118,6 +150,342 @@ namespace MilchZocker.AvatarOptimizer
             return null;
         }
 
+        /// <summary>
+        /// Analyze materials for atlasing compatibility and generate detailed report
+        /// </summary>
+        private MaterialAtlasAnalysis AnalyzeMaterialAtlasing()
+        {
+            var analysis = new MaterialAtlasAnalysis();
+
+            if (!optimizer.atlasSettings.generateTextureAtlas)
+            {
+                LogBuffered("⚠️ Texture atlasing is disabled - skipping analysis");
+                return analysis;
+            }
+
+            LogBuffered("🔍 Analyzing Material Atlasing Compatibility...");
+            PushLogIndent();
+
+            // Collect all renderers and materials
+            var renderers = context.AvatarRootTransform.GetComponentsInChildren<Renderer>(true);
+            var allMaterials = new HashSet<Material>();
+
+            foreach (var renderer in renderers)
+            {
+                foreach (var mat in renderer.sharedMaterials)
+                {
+                    if (mat != null && mat.shader != null)
+                        allMaterials.Add(mat);
+                }
+            }
+
+            analysis.totalMaterials = allMaterials.Count;
+            LogBuffered($"📊 Found {analysis.totalMaterials} unique materials");
+
+            // Analyze each material
+            foreach (var mat in allMaterials)
+            {
+                var info = new MaterialAtlasAnalysis.MaterialInfo
+                {
+                    material = mat,
+                    shaderName = mat.shader.name
+                };
+
+                // Check exclusion reasons
+                bool excluded = false;
+
+                // 1. Check if shader is filtered
+                if (!ShouldIncludeShader(mat.shader))
+                {
+                    info.canAtlas = false;
+                    info.reasons.Add($"❌ Shader '{mat.shader.name}' is in exclusion list");
+                    excluded = true;
+                }
+
+                // 2. Check if material is animated
+                if (!excluded && optimizer.atlasSettings.excludeAnimatedMaterials && animatedMaterials.Contains(mat))
+                {
+                    info.canAtlas = false;
+                    info.reasons.Add("❌ Material is animated");
+                    excluded = true;
+                }
+
+                // 3. Check material name patterns
+                if (!excluded && ShouldExcludeMaterialFromAtlas(mat))
+                {
+                    info.canAtlas = false;
+                    if (!string.IsNullOrEmpty(optimizer.atlasSettings.excludeMaterialPatterns))
+                    {
+                        info.reasons.Add($"❌ Material name matches exclusion pattern");
+                    }
+                    excluded = true;
+                }
+
+                // 4. Analyze texture properties
+                var allowedProps = GetAllowedTexturePropertiesForShader(mat.shader);
+
+                foreach (var prop in allowedProps)
+                {
+                    if (!mat.HasProperty(prop))
+                    {
+                        info.incompatibleProperties.Add($"{prop} (not present)");
+                        continue;
+                    }
+
+                    var tex = mat.GetTexture(prop);
+                    if (tex == null)
+                    {
+                        info.incompatibleProperties.Add($"{prop} (null texture)");
+                        continue;
+                    }
+
+                    if (tex.dimension != UnityEngine.Rendering.TextureDimension.Tex2D)
+                    {
+                        info.incompatibleProperties.Add($"{prop} ({tex.dimension} texture)");
+                        if (!excluded)
+                        {
+                            info.canAtlas = false;
+                            info.reasons.Add($"❌ Property '{prop}' has non-2D texture ({tex.dimension})");
+                            excluded = true;
+                        }
+                        continue;
+                    }
+
+                    var tex2D = tex as Texture2D;
+                    if (tex2D != null)
+                    {
+                        int texWidth = tex2D.width;
+                        int texHeight = tex2D.height;
+
+                        if (texWidth < optimizer.atlasSettings.minimumTextureSize || 
+                            texHeight < optimizer.atlasSettings.minimumTextureSize)
+                        {
+                            info.incompatibleProperties.Add($"{prop} (too small: {texWidth}x{texHeight})");
+                            continue;
+                        }
+
+                        info.compatibleProperties.Add($"{prop} ({texWidth}x{texHeight})");
+                    }
+                }
+
+                if (!excluded && info.compatibleProperties.Count == 0)
+                {
+                    info.canAtlas = false;
+                    info.reasons.Add("❌ No compatible 2D texture properties found");
+                    excluded = true;
+                }
+
+                if (!excluded)
+                {
+                    info.canAtlas = true;
+                    info.reasons.Add("✅ Can be atlased");
+                    analysis.atlaseableMaterials++;
+                }
+                else
+                {
+                    analysis.excludedMaterials++;
+                }
+
+                analysis.materials.Add(info);
+
+                // Group by shader
+                if (!analysis.materialsByShader.ContainsKey(info.shaderName))
+                    analysis.materialsByShader[info.shaderName] = new List<MaterialAtlasAnalysis.MaterialInfo>();
+
+                analysis.materialsByShader[info.shaderName].Add(info);
+            }
+
+            // Analyze grouping and compatibility between materials
+            LogBuffered($"\n📋 Atlasing Summary:");
+            LogBuffered($"   Total Materials: {analysis.totalMaterials}");
+            LogBuffered($"   ✅ Atlaseable: {analysis.atlaseableMaterials}");
+            LogBuffered($"   ❌ Excluded: {analysis.excludedMaterials}");
+
+            // Group atlaseable materials
+            int groupId = 0;
+            foreach (var kvp in analysis.materialsByShader)
+            {
+                var shaderName = kvp.Key;
+                var matsForShader = kvp.Value.Where(m => m.canAtlas).ToList();
+
+                if (matsForShader.Count < optimizer.atlasSettings.minimumMaterialsForAtlas)
+                {
+                    LogBuffered($"\n⚠️ Shader '{shaderName}': {matsForShader.Count} atlaseable materials (minimum: {optimizer.atlasSettings.minimumMaterialsForAtlas})");
+                    continue;
+                }
+
+                LogBuffered($"\n✅ Shader '{shaderName}': {matsForShader.Count} materials will be atlased");
+
+                // For enhanced workflow, group by texture signatures
+                if (optimizer.atlasSettings.useEnhancedAtlasWorkflow)
+                {
+                    var groups = GroupMaterialsByTextureSignature(matsForShader);
+
+                    // Consolidate small groups to avoid tiny atlases
+                    var consolidatedGroups = ConsolidateSmallGroups(groups);
+
+                    foreach (var group in consolidatedGroups)
+                    {
+                        if (group.Count >= optimizer.atlasSettings.minimumMaterialsForAtlas)
+                        {
+                            foreach (var info in group)
+                                info.groupId = groupId;
+
+                            analysis.atlasGroups.Add(group);
+                            LogBuffered($"   📦 Atlas Group {groupId}: {group.Count} materials with matching textures");
+                            PushLogIndent();
+                            foreach (var info in group.Take(5))
+                                LogBuffered($"   • {info.material.name}");
+                            if (group.Count > 5)
+                                LogBuffered($"   • ... and {group.Count - 5} more");
+                            PopLogIndent();
+                            groupId++;
+                        }
+                    }
+                }
+                else
+                {
+                    // Standard workflow: all materials with same shader can atlas together
+                    foreach (var info in matsForShader)
+                        info.groupId = groupId;
+
+                    analysis.atlasGroups.Add(matsForShader);
+                    LogBuffered($"   📦 Atlas Group {groupId}: All {matsForShader.Count} materials");
+                    groupId++;
+                }
+            }
+
+            // Detailed material breakdown
+            if (optimizer.atlasSettings.verboseLogging)
+            {
+                LogBuffered($"\n🔍 Detailed Material Analysis:");
+
+                foreach (var shaderGroup in analysis.materialsByShader.OrderBy(kvp => kvp.Key))
+                {
+                    LogBuffered($"\n📘 Shader: {shaderGroup.Key}");
+                    PushLogIndent();
+
+                    foreach (var info in shaderGroup.Value.OrderBy(m => m.canAtlas ? 0 : 1))
+                    {
+                        LogBuffered($"\n🎨 Material: {info.material.name}");
+                        PushLogIndent();
+
+                        LogBuffered($"Status: {(info.canAtlas ? "✅ Can Atlas" : "❌ Cannot Atlas")}");
+
+                        if (info.groupId >= 0)
+                            LogBuffered($"Atlas Group: #{info.groupId}");
+
+                        foreach (var reason in info.reasons)
+                            LogBuffered($"• {reason}");
+
+                        if (info.compatibleProperties.Count > 0)
+                        {
+                            LogBuffered($"Compatible Properties: {string.Join(", ", info.compatibleProperties)}");
+                        }
+
+                        if (info.incompatibleProperties.Count > 0)
+                        {
+                            LogBuffered($"Incompatible Properties: {string.Join(", ", info.incompatibleProperties)}");
+                        }
+
+                        PopLogIndent();
+                    }
+
+                    PopLogIndent();
+                }
+            }
+
+            PopLogIndent();
+            LogBuffered($"✅ Material atlasing analysis complete - {analysis.atlasGroups.Count} atlas groups will be generated");
+
+            return analysis;
+        }
+
+        /// <summary>
+        /// Group materials by their texture signatures for enhanced atlasing
+        /// </summary>
+        private List<List<MaterialAtlasAnalysis.MaterialInfo>> GroupMaterialsByTextureSignature(
+            List<MaterialAtlasAnalysis.MaterialInfo> materials)
+        {
+            var groups = new Dictionary<string, List<MaterialAtlasAnalysis.MaterialInfo>>();
+
+            foreach (var info in materials)
+            {
+                var signature = BuildTextureSignature(info.material);
+
+                if (!groups.ContainsKey(signature))
+                    groups[signature] = new List<MaterialAtlasAnalysis.MaterialInfo>();
+
+                groups[signature].Add(info);
+            }
+
+            return groups.Values.ToList();
+        }
+
+        /// <summary>
+        /// Consolidate small material groups to avoid generating tiny atlases.
+        /// Groups below the minimum threshold are merged together where possible.
+        /// </summary>
+        private List<List<MaterialAtlasAnalysis.MaterialInfo>> ConsolidateSmallGroups(List<List<MaterialAtlasAnalysis.MaterialInfo>> groups)
+        {
+            var consolidated = new List<List<MaterialAtlasAnalysis.MaterialInfo>>();
+            var pending = new List<MaterialAtlasAnalysis.MaterialInfo>();
+
+            // Process larger groups first
+            foreach (var group in groups.OrderByDescending(g => g.Count))
+            {
+                if (group.Count >= optimizer.atlasSettings.minimumMaterialsForAtlas)
+                {
+                    consolidated.Add(group);
+                }
+                else
+                {
+                    pending.AddRange(group);
+                }
+            }
+
+            // Merge leftover small groups if together they meet the threshold
+            if (pending.Count >= optimizer.atlasSettings.minimumMaterialsForAtlas)
+            {
+                consolidated.Add(pending);
+
+                if (optimizer.atlasSettings.verboseLogging)
+                {
+                    LogBuffered($"   Consolidated small groups into 1 group ({pending.Count} materials)");
+                }
+            }
+            else if (pending.Count > 0 && optimizer.atlasSettings.verboseLogging)
+            {
+                LogBuffered($"   Skipped {pending.Count} materials from small groups (below minimum threshold)");
+            }
+
+            return consolidated;
+        }
+
+        /// <summary>
+        /// Build a signature string representing the material's texture configuration
+        /// </summary>
+        private string BuildTextureSignature(Material mat)
+        {
+            var parts = new List<int>();
+            var allowedProps = GetAllowedTexturePropertiesForShader(mat.shader);
+
+            foreach (var prop in allowedProps.OrderBy(p => p))
+            {
+                if (mat.HasProperty(prop))
+                {
+                    var tex = mat.GetTexture(prop);
+                    parts.Add(tex != null ? tex.GetInstanceID() : -1);
+                }
+                else
+                {
+                    parts.Add(-1);
+                }
+            }
+
+            return string.Join("|", parts);
+        }
+
         public void Process()
         {
             var startTime = Time.realtimeSinceStartup;
@@ -167,11 +535,11 @@ namespace MilchZocker.AvatarOptimizer
                     PopLogIndent();
                 }
 
-                if (optimizer.meshSettings.stripUnusedMeshData)
+                if (optimizer.meshSettings.stripUnusedAttributes)
                 {
-                    LogBuffered("[AvatarOptimizer] Strip unused mesh data ON");
+                    LogBuffered("[AvatarOptimizer] Strip unused attributes ON");
                     PushLogIndent();
-                    StripUnusedMeshData();
+                    StripUnusedAttributes();
                     PopLogIndent();
                 }
 
@@ -193,6 +561,15 @@ namespace MilchZocker.AvatarOptimizer
 
                 if (optimizer.atlasSettings.generateTextureAtlas)
                 {
+                    LogBuffered("[AvatarOptimizer] ═══ Material Atlasing Analysis ═══");
+                    PushLogIndent();
+                    atlasAnalysis = AnalyzeMaterialAtlasing();
+                    PopLogIndent();
+                    LogBuffered("");
+                }
+
+                if (optimizer.atlasSettings.generateTextureAtlas)
+                {
                     LogBuffered("[AvatarOptimizer] Generate texture atlases ON");
                     PushLogIndent();
                     GenerateTextureAtlases();
@@ -210,6 +587,12 @@ namespace MilchZocker.AvatarOptimizer
 
                 // Try to apply any pending atlas import settings whose atlases are now saved to the AssetDatabase
                 ApplyPendingAtlasImportSettings();
+
+                // Rebuild MagicaCloth simulations after mesh/bone modifications
+                LogBuffered("[AvatarOptimizer] Rebuilding MagicaCloth simulations...");
+                PushLogIndent();
+                RebuildMagicaClothData(context.AvatarRootTransform);
+                PopLogIndent();
 
                 LogBuffered($"[AvatarOptimizer] ========== Optimization Complete in {optimizer.stats.optimizationTimeSeconds:F2}s ==========");
                 LogBuffered($"[AvatarOptimizer] Stats: {optimizer.stats.bonesRemoved} bones, {optimizer.stats.boneReferencesRemoved} bone refs, " +
@@ -283,9 +666,15 @@ namespace MilchZocker.AvatarOptimizer
 
         #region Mesh Utilities
 
-        private void StripUnusedMeshData()
+        private void StripUnusedAttributes()
         {
-            LogBuffered("[AvatarOptimizer] Stripping unused mesh data...");
+            if (!optimizer.meshSettings.stripUnusedAttributes)
+            {
+                LogBuffered("[AvatarOptimizer] Attribute stripping disabled");
+                return;
+            }
+
+            LogBuffered("[AvatarOptimizer] Stripping unused vertex attributes...");
             PushLogIndent();
             int strippedCount = 0;
 
@@ -296,34 +685,75 @@ namespace MilchZocker.AvatarOptimizer
 
                 bool modified = false;
 
-                if (mesh.tangents != null && mesh.tangents.Length > 0)
+                // Strip Tangents
+                if (optimizer.meshSettings.stripTangents && mesh.tangents != null && mesh.tangents.Length > 0)
                 {
+                    if (optimizer.meshSettings.verboseLogging)
+                        LogBuffered($"  Stripping tangents from {mesh.name}");
                     mesh.tangents = null;
                     modified = true;
                 }
 
-                if (mesh.colors != null && mesh.colors.Length > 0)
+                // Strip Vertex Colors
+                if (optimizer.meshSettings.stripVertexColors && mesh.colors != null && mesh.colors.Length > 0)
                 {
+                    if (optimizer.meshSettings.verboseLogging)
+                        LogBuffered($"  Stripping vertex colors from {mesh.name}");
                     mesh.colors = null;
                     modified = true;
                 }
 
-                // UV2 / lightmap UVs (older Unity versions may throw; ignore exceptions)
-                try
+                // Strip Lightmap UVs (UV2)
+                if (optimizer.meshSettings.stripLightmapUVs)
                 {
-                    var uv2 = mesh.uv2;
-                    if (uv2 != null && uv2.Length > 0)
+                    try
                     {
-                        mesh.uv2 = null;
-                        modified = true;
+                        var uv2 = mesh.uv2;
+                        if (uv2 != null && uv2.Length > 0)
+                        {
+                            if (optimizer.meshSettings.verboseLogging)
+                                LogBuffered($"  Stripping lightmap UVs from {mesh.name}");
+                            mesh.uv2 = null;
+                            modified = true;
+                        }
                     }
+                    catch { }
                 }
-                catch { }
+
+                // Strip Extra UV Channels (UV3, UV4)
+                if (optimizer.meshSettings.stripExtraUVChannels)
+                {
+                    try
+                    {
+                        var uv3 = mesh.uv3;
+                        if (uv3 != null && uv3.Length > 0)
+                        {
+                            if (optimizer.meshSettings.verboseLogging)
+                                LogBuffered($"  Stripping UV3 from {mesh.name}");
+                            mesh.uv3 = null;
+                            modified = true;
+                        }
+                    }
+                    catch { }
+
+                    try
+                    {
+                        var uv4 = mesh.uv4;
+                        if (uv4 != null && uv4.Length > 0)
+                        {
+                            if (optimizer.meshSettings.verboseLogging)
+                                LogBuffered($"  Stripping UV4 from {mesh.name}");
+                            mesh.uv4 = null;
+                            modified = true;
+                        }
+                    }
+                    catch { }
+                }
 
                 if (modified) strippedCount++;
             }
 
-            LogBuffered($"[AvatarOptimizer] Stripped mesh data from {strippedCount} meshes");
+            LogBuffered($"[AvatarOptimizer] Stripped attributes from {strippedCount} meshes");
             PopLogIndent();
         }
 
@@ -863,7 +1293,7 @@ namespace MilchZocker.AvatarOptimizer
 
                 if (blendshapesToRemove.Count > 0)
                 {
-                    var newMesh = CopyMeshWithoutBlendshapes(mesh, blendshapesToRemove);
+                    var newMesh = CopyMeshWithoutBlendshapes(smr, mesh, blendshapesToRemove);
                     smr.sharedMesh = newMesh;
                     optimizedMeshes[smr] = newMesh;
                     totalRemoved += blendshapesToRemove.Count;
@@ -879,14 +1309,20 @@ namespace MilchZocker.AvatarOptimizer
             LogBuffered("[AvatarOptimizer] --- RemoveUnusedBlendshapes END ---");
         }
 
-        private Mesh CopyMeshWithoutBlendshapes(Mesh sourceMesh, List<int> blendshapesToRemove)
+        private Mesh CopyMeshWithoutBlendshapes(SkinnedMeshRenderer smr, Mesh sourceMesh, List<int> blendshapesToRemove)
         {
+            var vertices = sourceMesh.vertices;
+            var normals = sourceMesh.normals;
+            var tangents = sourceMesh.tangents;
+
+            ApplyCurrentRemovedBlendshapeWeights(smr, sourceMesh, blendshapesToRemove, vertices, normals, tangents);
+
             var newMesh = new Mesh();
             newMesh.name = sourceMesh.name + "_Optimized";
-            newMesh.vertices = sourceMesh.vertices;
+            newMesh.vertices = vertices;
             newMesh.triangles = sourceMesh.triangles;
-            newMesh.normals = sourceMesh.normals;
-            newMesh.tangents = sourceMesh.tangents;
+            newMesh.normals = normals;
+            newMesh.tangents = tangents;
             newMesh.uv = sourceMesh.uv;
             newMesh.uv2 = sourceMesh.uv2;
             newMesh.uv3 = sourceMesh.uv3;
@@ -923,6 +1359,150 @@ namespace MilchZocker.AvatarOptimizer
             }
 
             return newMesh;
+        }
+
+        private void ApplyCurrentRemovedBlendshapeWeights(
+            SkinnedMeshRenderer smr,
+            Mesh sourceMesh,
+            List<int> blendshapesToRemove,
+            Vector3[] vertices,
+            Vector3[] normals,
+            Vector4[] tangents)
+        {
+            if (smr == null || sourceMesh == null || blendshapesToRemove == null || blendshapesToRemove.Count == 0)
+                return;
+
+            bool hasNormals = normals != null && normals.Length == vertices.Length;
+            bool hasTangents = tangents != null && tangents.Length == vertices.Length;
+
+            foreach (var blendshapeIndex in blendshapesToRemove)
+            {
+                float currentWeight = smr.GetBlendShapeWeight(blendshapeIndex);
+                if (currentWeight <= 0.0001f)
+                    continue;
+
+                int frameCount = sourceMesh.GetBlendShapeFrameCount(blendshapeIndex);
+                if (frameCount <= 0)
+                    continue;
+
+                if (frameCount == 1)
+                {
+                    float frameWeight = sourceMesh.GetBlendShapeFrameWeight(blendshapeIndex, 0);
+                    float scale = frameWeight > 0.0001f ? Mathf.Clamp01(currentWeight / frameWeight) : 0f;
+                    ApplyBlendshapeFrameToMesh(sourceMesh, blendshapeIndex, 0, scale, vertices, normals, tangents, hasNormals, hasTangents);
+                    continue;
+                }
+
+                int lowerFrame = -1;
+                int upperFrame = -1;
+                float lowerWeight = 0f;
+                float upperWeight = 0f;
+
+                for (int frame = 0; frame < frameCount; frame++)
+                {
+                    float frameWeight = sourceMesh.GetBlendShapeFrameWeight(blendshapeIndex, frame);
+
+                    if (frameWeight <= currentWeight)
+                    {
+                        lowerFrame = frame;
+                        lowerWeight = frameWeight;
+                    }
+
+                    if (frameWeight >= currentWeight)
+                    {
+                        upperFrame = frame;
+                        upperWeight = frameWeight;
+                        break;
+                    }
+                }
+
+                if (upperFrame == -1)
+                {
+                    ApplyBlendshapeFrameToMesh(sourceMesh, blendshapeIndex, frameCount - 1, 1f, vertices, normals, tangents, hasNormals, hasTangents);
+                    continue;
+                }
+
+                if (lowerFrame == -1)
+                {
+                    float scale = upperWeight > 0.0001f ? Mathf.Clamp01(currentWeight / upperWeight) : 0f;
+                    ApplyBlendshapeFrameToMesh(sourceMesh, blendshapeIndex, upperFrame, scale, vertices, normals, tangents, hasNormals, hasTangents);
+                    continue;
+                }
+
+                if (lowerFrame == upperFrame)
+                {
+                    ApplyBlendshapeFrameToMesh(sourceMesh, blendshapeIndex, lowerFrame, 1f, vertices, normals, tangents, hasNormals, hasTangents);
+                    continue;
+                }
+
+                float denominator = upperWeight - lowerWeight;
+                float t = denominator > 0.0001f ? Mathf.Clamp01((currentWeight - lowerWeight) / denominator) : 0f;
+
+                Vector3[] lowerDeltaVertices = new Vector3[sourceMesh.vertexCount];
+                Vector3[] lowerDeltaNormals = new Vector3[sourceMesh.vertexCount];
+                Vector3[] lowerDeltaTangents = new Vector3[sourceMesh.vertexCount];
+                sourceMesh.GetBlendShapeFrameVertices(blendshapeIndex, lowerFrame, lowerDeltaVertices, lowerDeltaNormals, lowerDeltaTangents);
+
+                Vector3[] upperDeltaVertices = new Vector3[sourceMesh.vertexCount];
+                Vector3[] upperDeltaNormals = new Vector3[sourceMesh.vertexCount];
+                Vector3[] upperDeltaTangents = new Vector3[sourceMesh.vertexCount];
+                sourceMesh.GetBlendShapeFrameVertices(blendshapeIndex, upperFrame, upperDeltaVertices, upperDeltaNormals, upperDeltaTangents);
+
+                for (int i = 0; i < vertices.Length; i++)
+                {
+                    vertices[i] += Vector3.LerpUnclamped(lowerDeltaVertices[i], upperDeltaVertices[i], t);
+
+                    if (hasNormals)
+                    {
+                        normals[i] += Vector3.LerpUnclamped(lowerDeltaNormals[i], upperDeltaNormals[i], t);
+                    }
+
+                    if (hasTangents)
+                    {
+                        var delta = Vector3.LerpUnclamped(lowerDeltaTangents[i], upperDeltaTangents[i], t);
+                        tangents[i].x += delta.x;
+                        tangents[i].y += delta.y;
+                        tangents[i].z += delta.z;
+                    }
+                }
+            }
+        }
+
+        private void ApplyBlendshapeFrameToMesh(
+            Mesh sourceMesh,
+            int blendshapeIndex,
+            int frame,
+            float scale,
+            Vector3[] vertices,
+            Vector3[] normals,
+            Vector4[] tangents,
+            bool hasNormals,
+            bool hasTangents)
+        {
+            if (scale <= 0.0001f)
+                return;
+
+            Vector3[] deltaVertices = new Vector3[sourceMesh.vertexCount];
+            Vector3[] deltaNormals = new Vector3[sourceMesh.vertexCount];
+            Vector3[] deltaTangents = new Vector3[sourceMesh.vertexCount];
+            sourceMesh.GetBlendShapeFrameVertices(blendshapeIndex, frame, deltaVertices, deltaNormals, deltaTangents);
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                vertices[i] += deltaVertices[i] * scale;
+
+                if (hasNormals)
+                {
+                    normals[i] += deltaNormals[i] * scale;
+                }
+
+                if (hasTangents)
+                {
+                    tangents[i].x += deltaTangents[i].x * scale;
+                    tangents[i].y += deltaTangents[i].y * scale;
+                    tangents[i].z += deltaTangents[i].z * scale;
+                }
+            }
         }
 
         #endregion
@@ -1327,7 +1907,7 @@ namespace MilchZocker.AvatarOptimizer
                     if (optimizer.meshSettings.mergeIdenticalSubmeshes)
                         MergeIdenticalSubmeshes(mesh, smr.sharedMaterials);
 
-                    if (optimizer.meshSettings.intelligentAttributeStripping)
+                    if (optimizer.meshSettings.stripUnusedAttributes)
                         StripUnusedVertexAttributesIntelligent(mesh, smr.sharedMaterials);
                 }
             }
@@ -1693,6 +2273,13 @@ namespace MilchZocker.AvatarOptimizer
             LogBuffered("[AvatarOptimizer] --- GenerateTextureAtlases START ---");
             PushLogIndent();
 
+            // ✅ CLEAR TRACKING STATE AT START: Ensure clean slate for this method execution
+            // This is critical because if other NDMF scripts run before us and add materials,
+            // we only want to track the materials that WE ACTUALLY PROCESS
+            originalTextureMemory.Clear();
+            accountedAtlases.Clear();
+            totalAtlasMemoryBytes = 0;
+
             if (optimizer.atlasSettings.excludeAnimatedMaterials)
             {
                 CollectAnimatedMaterials();
@@ -1702,12 +2289,15 @@ namespace MilchZocker.AvatarOptimizer
 
             var materialsByShader = new Dictionary<string, List<Material>>();
 
+            // ✅ TRACK ORIGINAL MEMORY: Collect materials and track their memory at the START,
+            // ONLY for materials that pass our filtering (will actually be processed)
             foreach (var renderer in renderers)
             {
                 foreach (var mat in renderer.sharedMaterials)
                 {
                     if (mat == null || mat.shader == null) continue;
 
+                    // Skip excluded/animated materials - don't track them
                     if (ShouldExcludeMaterialFromAtlas(mat))
                     {
                         if (optimizer.atlasSettings.verboseLogging)
@@ -1717,6 +2307,7 @@ namespace MilchZocker.AvatarOptimizer
                         continue;
                     }
 
+                    // Skip shaders not in our inclusion list - don't track them
                     if (!ShouldIncludeShader(mat.shader))
                     {
                         if (optimizer.atlasSettings.verboseLogging)
@@ -1725,6 +2316,9 @@ namespace MilchZocker.AvatarOptimizer
                         }
                         continue;
                     }
+
+                    // ✅ NOW track memory for this material (will be processed)
+                    TrackOriginalTextureMemory(mat);
 
                     string shaderName = mat.shader.name;
 
@@ -1772,6 +2366,7 @@ namespace MilchZocker.AvatarOptimizer
                 atlasesCreated += generated;
             }
 
+            // Replace atlased materials on all renderers
             foreach (var renderer in renderers)
             {
                 var materials = renderer.sharedMaterials;
@@ -1792,7 +2387,26 @@ namespace MilchZocker.AvatarOptimizer
                 }
             }
 
+            // ✅ CALCULATE SAVINGS AT END: Now that atlasing is complete,
+            // calculate the difference between original (tracked at start)
+            // and final (tracked during atlas creation)
+            long originalMemoryBytes = originalTextureMemory.Values.Sum();
+            long savedBytes = originalMemoryBytes - totalAtlasMemoryBytes;
+            float savedMB = savedBytes / (1024f * 1024f);
+
+            optimizer.stats.textureMemorySavedMB = Mathf.RoundToInt(savedMB);
             optimizer.stats.atlasesGenerated = atlasesCreated;
+
+            if (optimizer.atlasSettings.verboseLogging)
+            {
+                LogBuffered("[AvatarOptimizer] Texture Memory Analysis:");
+                LogBuffered($"  Tracked Original Materials: {originalTextureMemory.Count} items");
+                LogBuffered($"  Original Total: {originalMemoryBytes / (1024f * 1024f):F2} MB");
+                LogBuffered($"  Generated Atlases: {atlasesCreated}");
+                LogBuffered($"  Atlas Total: {totalAtlasMemoryBytes / (1024f * 1024f):F2} MB");
+                LogBuffered($"  Savings: {savedMB:F2} MB {(savedBytes >= 0 ? "(compression)" : "(overhead)")}");
+            }
+
             LogBuffered($"[AvatarOptimizer] Texture atlas generation complete! Created {atlasesCreated} atlases");
 
             PopLogIndent();
@@ -1967,6 +2581,193 @@ namespace MilchZocker.AvatarOptimizer
             }
 
             return text.Contains(pattern, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private int GetBytesPerPixelForFormat(TextureFormat format)
+        {
+            switch (format)
+            {
+                // Uncompressed formats
+                case TextureFormat.RGBA32:
+                case TextureFormat.ARGB32:
+                case TextureFormat.BGRA32:
+                    return 4;
+
+                case TextureFormat.RGB24:
+                    return 3;
+
+                case TextureFormat.RGBAHalf:
+                    return 8;
+
+                case TextureFormat.RGBAFloat:
+                    return 16;
+
+                case TextureFormat.RG16:
+                case TextureFormat.RGBA4444:
+                case TextureFormat.ARGB4444:
+                case TextureFormat.RGB565:
+                    return 2;
+
+                case TextureFormat.Alpha8:
+                case TextureFormat.R8:
+                    return 1;
+
+                case TextureFormat.RG32:
+                    return 4;
+
+                case TextureFormat.RGB48:
+                    return 6;
+
+                // Compressed formats (handled specially in CalculateTextureMemoryBytes)
+                case TextureFormat.DXT1:
+                case TextureFormat.DXT1Crunched:
+                case TextureFormat.ETC_RGB4:
+                case TextureFormat.ETC2_RGB:
+                case TextureFormat.ETC2_RGBA1:
+                    return -1; // 0.5 bytes per pixel
+
+                case TextureFormat.DXT5:
+                case TextureFormat.DXT5Crunched:
+                case TextureFormat.BC7:
+                case TextureFormat.ETC2_RGBA8:
+                case TextureFormat.ASTC_4x4:
+                    return 1; // 1 byte per pixel
+
+                case TextureFormat.ASTC_6x6:
+                    return -2; // ~0.44 bytes per pixel
+
+                case TextureFormat.ASTC_8x8:
+                    return -3; // 0.25 bytes per pixel
+
+                default:
+                    return 4; // Fallback
+            }
+        }
+
+        private long CalculateTextureMemoryBytes(Texture2D texture)
+        {
+            if (texture == null) return 0;
+
+            int bytesPerPixelFlag = GetBytesPerPixelForFormat(texture.format);
+            long baseSize;
+
+            if (bytesPerPixelFlag == -1)
+            {
+                baseSize = ((long)texture.width * texture.height) / 2; // 4 bits per pixel
+            }
+            else if (bytesPerPixelFlag == -2)
+            {
+                baseSize = ((long)texture.width * texture.height * 356) / 800; // ~3.56 bpp
+            }
+            else if (bytesPerPixelFlag == -3)
+            {
+                baseSize = ((long)texture.width * texture.height) / 4; // 2 bits per pixel
+            }
+            else if (bytesPerPixelFlag > 0)
+            {
+                baseSize = (long)texture.width * texture.height * bytesPerPixelFlag;
+            }
+            else
+            {
+                baseSize = (long)texture.width * texture.height * 4; // Unknown fallback
+            }
+
+            if (texture.mipmapCount > 1)
+            {
+                baseSize = (long)(baseSize * 1.33f);
+            }
+
+            return baseSize;
+        }
+
+        private void TrackOriginalTextureMemory(Material mat)
+        {
+            if (mat == null || mat.shader == null) return;
+
+            var shader = mat.shader;
+            int propertyCount = ShaderUtil.GetPropertyCount(shader);
+
+            for (int i = 0; i < propertyCount; i++)
+            {
+                if (ShaderUtil.GetPropertyType(shader, i) != ShaderUtil.ShaderPropertyType.TexEnv) continue;
+
+                string propName = ShaderUtil.GetPropertyName(shader, i);
+                if (!ShouldIncludeTextureProperty(propName)) continue;
+
+                if (!mat.HasProperty(propName)) continue;
+
+                var tex = mat.GetTexture(propName) as Texture2D;
+                if (tex != null && !originalTextureMemory.ContainsKey(tex))
+                {
+                    long memoryBytes = CalculateTextureMemoryBytes(tex);
+                    originalTextureMemory[tex] = memoryBytes;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generate atlas name with optional complexity score and tier information
+        /// </summary>
+        private string GenerateAtlasName(string shaderName, string propertyName, TextureDensityAnalysis? analysis, int width, int height)
+        {
+            var settings = optimizer.atlasSettings;
+            var parts = new List<string>();
+            
+            // Prefix
+            if (!string.IsNullOrEmpty(settings.atlasNamePrefix))
+            {
+                parts.Add(settings.atlasNamePrefix);
+            }
+            else
+            {
+                parts.Add("Atlas");
+            }
+            
+            // Shader name
+            if (settings.includeShaderInName && !string.IsNullOrEmpty(shaderName))
+            {
+                string cleanShaderName = shaderName.Replace("/", "_").Replace(".", "_");
+                parts.Add(cleanShaderName);
+            }
+            
+            // Property name
+            if (settings.includePropertyInName && !string.IsNullOrEmpty(propertyName))
+            {
+                parts.Add(propertyName);
+            }
+            
+            // Tier name
+            if (settings.includeTierInName && analysis.HasValue && analysis.Value.tier != null)
+            {
+                parts.Add(analysis.Value.tier.tierName);
+            }
+            
+            // Complexity score
+            if (settings.includeComplexityScore && analysis.HasValue)
+            {
+                parts.Add($"Score{analysis.Value.complexityScore:F2}");
+            }
+            
+            // Dimensions
+            parts.Add($"{width}x{height}");
+            
+            // Timestamp
+            if (settings.addTimestampToName)
+            {
+                parts.Add(System.DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            }
+            
+            return string.Join("_", parts);
+        }
+
+        private void TrackAtlasMemory(Texture2D atlas)
+        {
+            if (atlas == null) return;
+            if (accountedAtlases.Contains(atlas)) return;
+
+            long atlasMemoryBytes = CalculateTextureMemoryBytes(atlas);
+            totalAtlasMemoryBytes += atlasMemoryBytes;
+            accountedAtlases.Add(atlas);
         }
 
         private int GenerateAtlasForShaderAutomatic(string shaderName, List<Material> materials)
@@ -2174,6 +2975,47 @@ namespace MilchZocker.AvatarOptimizer
                     }
                 }
 
+                // Apply texture size normalization if enabled
+                if (optimizer.atlasSettings.normalizeTextureSizes)
+                {
+                    int minWidth = int.MaxValue;
+                    int minHeight = int.MaxValue;
+
+                    foreach (var mat in mats)
+                    {
+                        if (mat.HasProperty(repProp))
+                        {
+                            var tex = mat.GetTexture(repProp) as Texture2D;
+                            if (tex != null)
+                            {
+                                minWidth = Mathf.Min(minWidth, tex.width);
+                                minHeight = Mathf.Min(minHeight, tex.height);
+                            }
+                        }
+                    }
+
+                    if (minWidth != int.MaxValue && minHeight != int.MaxValue)
+                    {
+                        float widthRatio = (float)maxWidth / minWidth;
+                        float heightRatio = (float)maxHeight / minHeight;
+
+                        if (widthRatio > optimizer.atlasSettings.maxTextureSizeRatio ||
+                            heightRatio > optimizer.atlasSettings.maxTextureSizeRatio)
+                        {
+                            maxWidth = Mathf.Min(maxWidth, Mathf.RoundToInt(minWidth * optimizer.atlasSettings.maxTextureSizeRatio));
+                            maxHeight = Mathf.Min(maxHeight, Mathf.RoundToInt(minHeight * optimizer.atlasSettings.maxTextureSizeRatio));
+
+                            maxWidth = Mathf.NextPowerOfTwo(maxWidth);
+                            maxHeight = Mathf.NextPowerOfTwo(maxHeight);
+
+                            if (optimizer.atlasSettings.verboseLogging)
+                            {
+                                LogBuffered($"    Normalized texture sizes for {repProp}: capped at {maxWidth}x{maxHeight} (ratio {optimizer.atlasSettings.maxTextureSizeRatio}x)");
+                            }
+                        }
+                    }
+                }
+
                 // Apply minimum output atlas size if configured
                 if (optimizer.atlasSettings.minimumOutputAtlasSize > 0)
                 {
@@ -2214,7 +3056,15 @@ namespace MilchZocker.AvatarOptimizer
             string driverProp = representativeProps[0];
             var driverTextures = texturesByRepProp[driverProp];
 
-            int optimalPadding = optimizer.atlasSettings.useMipAwarePadding ? CalculateOptimalPadding((int)optimizer.atlasSettings.maxAtlasSize) : optimizer.atlasSettings.atlasPadding;
+            int optimalPadding;
+            if (optimizer.atlasSettings.useMipAwarePadding)
+            {
+                optimalPadding = CalculateOptimalPadding((int)optimizer.atlasSettings.maxAtlasSize);
+            }
+            else
+            {
+                optimalPadding = CalculateAtlasPadding((int)optimizer.atlasSettings.maxAtlasSize, mats.Count);
+            }
 
             var driverRes = ManagedAtlasPacker.PackTextures(
                 driverTextures,
@@ -2228,6 +3078,8 @@ namespace MilchZocker.AvatarOptimizer
                 return false;
             }
 
+            TrackAtlasMemory(driverRes.atlas);
+
             int atlasW = driverRes.width;
             int atlasH = driverRes.height;
 
@@ -2240,8 +3092,25 @@ namespace MilchZocker.AvatarOptimizer
                     bool done = OptimizeAtlasFragmentation(driverTextures, ref packing.uvRects, ref packing.width, ref packing.height);
                     if (done) break;
                     attempt++;
-                    packing = ManagedAtlasPacker.PackTextures(driverTextures, Mathf.Max(packing.width, packing.height, (int)optimizer.atlasSettings.maxAtlasSize), optimalPadding, true);
+
+                    int adaptivePadding;
+                    if (optimizer.atlasSettings.useMipAwarePadding)
+                    {
+                        adaptivePadding = CalculateOptimalPadding(Mathf.Max(packing.width, packing.height));
+                    }
+                    else
+                    {
+                        adaptivePadding = CalculateAtlasPadding(Mathf.Max(packing.width, packing.height), driverTextures.Length);
+                    }
+
+                    packing = ManagedAtlasPacker.PackTextures(
+                        driverTextures,
+                        Mathf.Max(packing.width, packing.height, (int)optimizer.atlasSettings.maxAtlasSize),
+                        adaptivePadding,
+                        true);
+
                     if (packing == null || packing.atlas == null) break;
+                    TrackAtlasMemory(packing.atlas);
                 }
                 driverRes = packing;
                 atlasW = driverRes.width;
@@ -2249,7 +3118,18 @@ namespace MilchZocker.AvatarOptimizer
             }
 
             var atlasesByRep = new Dictionary<string, (Texture2D atlas, Rect[] rects)>();
+            
+            // Analyze and name the driver atlas
+            var driverAnalysis = AnalyzeTextureDensity(driverRes.atlas, driverProp);
+            driverRes.atlas.name = GenerateAtlasName(shaderName, driverProp, driverAnalysis, atlasW, atlasH);
+            
             atlasesByRep[driverProp] = (driverRes.atlas, driverRes.uvRects);
+            
+            // Store for import settings
+            if (!atlasImportSettings.ContainsKey(driverRes.atlas))
+            {
+                atlasImportSettings[driverRes.atlas] = driverAnalysis;
+            }
 
             // Pack other representative props
             foreach (var repProp in representativeProps)
@@ -2258,13 +3138,37 @@ namespace MilchZocker.AvatarOptimizer
 
                 if (enhanced)
                 {
-                    var fixedAtlas = BuildAtlasFromFixedLayout(texturesByRepProp[repProp], driverRes.uvRects, atlasW, atlasH);
+                    // First pass without analysis to create the atlas
+                    var fixedAtlas = BuildAtlasFromFixedLayout(texturesByRepProp[repProp], driverRes.uvRects, atlasW, atlasH, shaderName, repProp, null);
                     if (fixedAtlas == null)
                     {
                         LogBuffered($"[AvatarOptimizer] ✗ Failed to build fixed-layout atlas for '{repProp}' on '{shaderName}'");
                         return false;
                     }
+                    
+                    // Now analyze the created atlas
+                    var analysis = AnalyzeTextureDensity(fixedAtlas, repProp);
+                    
+                    // Rebuild with proper naming if complexity score is needed
+                    if (optimizer.atlasSettings.includeComplexityScore || optimizer.atlasSettings.includeTierInName)
+                    {
+                        UnityEngine.Object.DestroyImmediate(fixedAtlas);
+                        fixedAtlas = BuildAtlasFromFixedLayout(texturesByRepProp[repProp], driverRes.uvRects, atlasW, atlasH, shaderName, repProp, analysis);
+                        
+                        if (fixedAtlas == null)
+                        {
+                            LogBuffered($"[AvatarOptimizer] ✗ Failed to rebuild fixed-layout atlas for '{repProp}' on '{shaderName}'");
+                            return false;
+                        }
+                    }
+                    
                     atlasesByRep[repProp] = (fixedAtlas, driverRes.uvRects);
+                    
+                    // Store for import settings
+                    if (!atlasImportSettings.ContainsKey(fixedAtlas))
+                    {
+                        atlasImportSettings[fixedAtlas] = analysis;
+                    }
                 }
                 else
                 {
@@ -2279,8 +3183,24 @@ namespace MilchZocker.AvatarOptimizer
                         LogBuffered($"[AvatarOptimizer] ✗ Failed to pack atlas for '{repProp}' on '{shaderName}'");
                         return false;
                     }
+                    TrackAtlasMemory(res.atlas);
+                    
+                    // Analyze and apply naming
+                    var analysis = AnalyzeTextureDensity(res.atlas, repProp);
+                    res.atlas.name = GenerateAtlasName(shaderName, repProp, analysis, res.width, res.height);
+                    
                     atlasesByRep[repProp] = (res.atlas, res.uvRects);
+                    
+                    if (!atlasImportSettings.ContainsKey(res.atlas))
+                    {
+                        atlasImportSettings[res.atlas] = analysis;
+                    }
                 }
+            }
+
+            foreach (var kvp in atlasesByRep)
+            {
+                TrackAtlasMemory(kvp.Value.atlas);
             }
 
             // Optional seam padding and normal preservation for each rep atlas
@@ -2430,29 +3350,50 @@ namespace MilchZocker.AvatarOptimizer
 
                 if (slots.Count == 0) continue;
 
-                bool multipleRects = rects.Select(r => $"{r.x:F4},{r.y:F4},{r.width:F4},{r.height:F4}").Distinct().Count() > 1;
-                if (multipleRects)
-                {
-                    LogBuffered($"[AvatarOptimizer] Skipping enhanced baking for renderer '{renderer.name}' - multiple atlas rects across its materials.");
-                    continue;
-                }
+                // Distinct rects for informational logging only; we still bake per-slot
+                int uniqueRectCount = rects.Select(r => $"{r.x:F4},{r.y:F4},{r.width:F4},{r.height:F4}").Distinct().Count();
+                bool multipleRects = uniqueRectCount > 1;
 
-                Rect rectForRenderer = rects[0];
+                if (multipleRects && optimizer.atlasSettings.verboseLogging)
+                {
+                    LogBuffered($"[AvatarOptimizer] Renderer '{renderer.name}' has {uniqueRectCount} unique atlas rects - baking UVs per-slot");
+                }
 
                 if (renderer is SkinnedMeshRenderer smr)
                 {
-                    foreach (var slot in slots)
-                        BakeSubmeshUVsToRect(smr, slot, rectForRenderer);
+                    // Bake each slot to its specific rect
+                    for (int s = 0; s < slots.Count; s++)
+                    {
+                        BakeSubmeshUVsToRect(smr, slots[s], rects[s]);
+                    }
                 }
                 else if (renderer is MeshRenderer mr)
                 {
                     var mf = mr.GetComponent<MeshFilter>();
                     if (mf != null)
-                        BakeMeshUVsToRect(mf, rectForRenderer);
+                    {
+                        if (multipleRects)
+                        {
+                            if (optimizer.atlasSettings.verboseLogging)
+                            {
+                                LogBuffered($"[AvatarOptimizer] Warning: MeshRenderer '{renderer.name}' has multiple rects - UV baking may not be accurate");
+                            }
+
+                            // Fallback: use the first rect
+                            BakeMeshUVsToRect(mf, rects[0]);
+                        }
+                        else
+                        {
+                            BakeMeshUVsToRect(mf, rects[0]);
+                        }
+                    }
                 }
 
+                // Replace all atlased material slots with master material
                 for (int s = 0; s < slots.Count; s++)
+                {
                     mats[slots[s]] = masterMat;
+                }
 
                 renderer.sharedMaterials = mats;
             }
@@ -2537,6 +3478,49 @@ namespace MilchZocker.AvatarOptimizer
             {
                 LogBuffered($"  Increased padding to {finalPadding}px (from {optimizer.atlasSettings.atlasPadding}px) to prevent mip bleeding");
             }
+            return finalPadding;
+        }
+
+        /// <summary>
+        /// Calculate adaptive padding based on atlas size and texture density.
+        /// </summary>
+        private int CalculateAtlasPadding(int atlasSize, int textureCount)
+        {
+            int basePadding;
+
+            if (atlasSize <= 1024)
+            {
+                basePadding = 2;
+            }
+            else if (atlasSize <= 2048)
+            {
+                basePadding = 4;
+            }
+            else
+            {
+                basePadding = 8;
+            }
+
+            if (textureCount > 16)
+            {
+                basePadding = Mathf.Max(1, basePadding - 1);
+            }
+            else if (textureCount > 8)
+            {
+                basePadding = Mathf.Max(1, basePadding);
+            }
+            else if (textureCount <= 4)
+            {
+                basePadding = Mathf.Min(16, basePadding + 2);
+            }
+
+            int finalPadding = Mathf.Clamp(basePadding, 1, 16);
+
+            if (optimizer.atlasSettings.verboseLogging && finalPadding != optimizer.atlasSettings.atlasPadding)
+            {
+                LogBuffered($"  Adaptive padding: {finalPadding}px (atlas {atlasSize}x{atlasSize}, textures {textureCount}, configured {optimizer.atlasSettings.atlasPadding}px)");
+            }
+
             return finalPadding;
         }
 
@@ -2741,7 +3725,7 @@ namespace MilchZocker.AvatarOptimizer
 
         private void StripUnusedVertexAttributesIntelligent(Mesh mesh, Material[] materials)
         {
-            if (mesh == null || materials == null || !optimizer.meshSettings.intelligentAttributeStripping) return;
+            if (mesh == null || materials == null || !optimizer.meshSettings.stripUnusedAttributes) return;
             bool needTangents = false, needColors = false, needUV2 = false, needUV3 = false, needUV4 = false;
             foreach (var mat in materials.Where(m => m != null && m.shader != null))
             {
@@ -3094,7 +4078,11 @@ namespace MilchZocker.AvatarOptimizer
             }
             else if (tier.useCustomFormat)
             {
-                importer.textureCompression = TextureImporterCompression.Uncompressed;
+                // Use Compressed mode to allow crunch compression to work when adaptive compression is enabled
+                // Crunch compression only works when textureCompression is set to Compressed, not Uncompressed
+                importer.textureCompression = optimizer.atlasSettings.useAdaptiveCompression 
+                    ? TextureImporterCompression.Compressed 
+                    : TextureImporterCompression.Uncompressed;
                 
                 if (optimizer.atlasSettings.usePlatformSpecificCompression)
                 {
@@ -3253,7 +4241,7 @@ namespace MilchZocker.AvatarOptimizer
 
         #endregion
 
-        private Texture2D BuildAtlasFromFixedLayout(Texture2D[] textures, Rect[] rects, int atlasWidth, int atlasHeight)
+        private Texture2D BuildAtlasFromFixedLayout(Texture2D[] textures, Rect[] rects, int atlasWidth, int atlasHeight, string shaderName, string propertyName, TextureDensityAnalysis? analysis)
         {
             if (textures == null || rects == null || textures.Length != rects.Length)
                 return null;
@@ -3279,12 +4267,17 @@ namespace MilchZocker.AvatarOptimizer
             }
 
             atlas.Apply();
-            atlas.name = $"AtlasFixed_{atlasWidth}x{atlasHeight}";
+            
+            // Use the new naming method
+            atlas.name = GenerateAtlasName(shaderName, propertyName, analysis, atlasWidth, atlasHeight);
+            
+            TrackAtlasMemory(atlas);
             return atlas;
         }
 
         private void BakeSubmeshUVsToRect(SkinnedMeshRenderer smr, int materialSlot, Rect rect)
         {
+            // Create or reuse a baked mesh copy to avoid modifying shared assets
             var mesh = GetOrCreateMeshCopy(smr, "_UVBaked");
             if (mesh == null) return;
 
@@ -3294,6 +4287,7 @@ namespace MilchZocker.AvatarOptimizer
             var uvs = mesh.uv;
             if (uvs == null || uvs.Length == 0) return;
 
+            // Only modify vertices used by this submesh
             var triangles = mesh.GetTriangles(materialSlot);
             var used = new HashSet<int>(triangles);
 
@@ -3302,12 +4296,17 @@ namespace MilchZocker.AvatarOptimizer
                 if (!used.Contains(i)) continue;
 
                 Vector2 uv = uvs[i];
-                uv.x = rect.x + uv.x * rect.width;
-                uv.y = rect.y + uv.y * rect.height;
+                uv.x = rect.x + (uv.x * rect.width);
+                uv.y = rect.y + (uv.y * rect.height);
                 uvs[i] = uv;
             }
 
             mesh.uv = uvs;
+
+            if (optimizer.atlasSettings.verboseLogging)
+            {
+                LogBuffered($"  Baked UVs for submesh {materialSlot} to rect ({rect.x:F3}, {rect.y:F3}, {rect.width:F3}, {rect.height:F3})");
+            }
         }
 
         private void BakeMeshUVsToRect(MeshFilter mf, Rect rect)
@@ -3542,6 +4541,105 @@ namespace MilchZocker.AvatarOptimizer
             }
             
             return true;
+        }
+
+        #endregion
+
+        #region MagicaCloth Rebuilding
+
+        /// <summary>
+        /// Rebuilds all MagicaCloth components on the avatar.
+        /// Call this after making modifications to meshes, bones, or transforms that affect cloth simulation.
+        /// </summary>
+        private void RebuildMagicaClothData(Transform avatarRoot)
+        {
+#if CCKADDINMAGICACLOTHSUPPORT
+            if (avatarRoot == null)
+            {
+                LogBuffered("MagicaCloth Rebuild: avatarRoot is null, skipping.");
+                return;
+            }
+
+            // Rebuild RenderDeformers
+            var renderDeformers = avatarRoot.GetComponentsInChildren<MagicaRenderDeformer>(true).ToList();
+            LogBuffered($"Rebuilding MagicaRenderDeformer data: {renderDeformers.Count}");
+            PushLogIndent();
+            foreach (var rd in renderDeformers)
+            {
+                if (rd == null) continue;
+                try
+                {
+                    BuildManager.CreateComponent(rd);
+                    EditorUtility.SetDirty(rd);
+                }
+                catch (System.Exception ex)
+                {
+                    LogBuffered($"Failed to rebuild RenderDeformer: {ex.Message}");
+                }
+            }
+            PopLogIndent();
+
+            // Rebuild VirtualDeformers
+            var virtualDeformers = avatarRoot.GetComponentsInChildren<MagicaVirtualDeformer>(true).ToList();
+            LogBuffered($"Rebuilding MagicaVirtualDeformer data: {virtualDeformers.Count}");
+            PushLogIndent();
+            foreach (var vd in virtualDeformers)
+            {
+                if (vd == null) continue;
+                try
+                {
+                    BuildManager.CreateComponent(vd);
+                    EditorUtility.SetDirty(vd);
+                }
+                catch (System.Exception ex)
+                {
+                    LogBuffered($"Failed to rebuild VirtualDeformer: {ex.Message}");
+                }
+            }
+            PopLogIndent();
+
+            // Rebuild BoneCloths
+            var boneCloths = avatarRoot.GetComponentsInChildren<MagicaBoneCloth>(true).ToList();
+            LogBuffered($"Rebuilding MagicaBoneCloth data: {boneCloths.Count}");
+            PushLogIndent();
+            foreach (var bc in boneCloths)
+            {
+                if (bc == null) continue;
+                try
+                {
+                    BuildManager.CreateComponent(bc);
+                    EditorUtility.SetDirty(bc);
+                }
+                catch (System.Exception ex)
+                {
+                    LogBuffered($"Failed to rebuild BoneCloth: {ex.Message}");
+                }
+            }
+            PopLogIndent();
+
+            // Rebuild MeshCloths
+            var meshCloths = avatarRoot.GetComponentsInChildren<MagicaMeshCloth>(true).ToList();
+            LogBuffered($"Rebuilding MagicaMeshCloth data: {meshCloths.Count}");
+            PushLogIndent();
+            foreach (var mc in meshCloths)
+            {
+                if (mc == null) continue;
+                try
+                {
+                    BuildManager.CreateComponent(mc);
+                    EditorUtility.SetDirty(mc);
+                }
+                catch (System.Exception ex)
+                {
+                    LogBuffered($"Failed to rebuild MeshCloth: {ex.Message}");
+                }
+            }
+            PopLogIndent();
+
+            LogBuffered("MagicaCloth rebuild complete.");
+#else
+            LogBuffered("MagicaCloth support is not enabled (CCKADDINMAGICACLOTHSUPPORT not defined).");
+#endif
         }
 
         #endregion
