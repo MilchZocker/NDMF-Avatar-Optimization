@@ -63,9 +63,8 @@ The tool records findings, warnings, and summary information and can run in repo
 1. Open Window → Package Manager
 2. Click the + button in the top-left corner
 3. Choose Add package from git URL...
-4. Enter one of the following:
-   - `https://github.com/MilchZocker/NDMF-Avatar-Optimization.git#main` for the current default branch
-   - `https://github.com/MilchZocker/NDMF-Avatar-Optimization.git#upm` once the UPM branch has been published by the workflow
+4. Enter the following:
+   - `https://github.com/MilchZocker/NDMF-Avatar-Optimization.git#upm`
 5. Click Add
 
 ### Option B: Manual installation
