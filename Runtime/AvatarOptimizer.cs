@@ -23,6 +23,26 @@ namespace MilchZocker.AvatarOptimizer
         [Header("=== Texture Atlas Generation ===")]
         [Space(5)]
         public AtlasGenerationSettings atlasSettings = new AtlasGenerationSettings();
+
+        [Header("=== Optimization Analysis ===")]
+        [Space(5)]
+        [Tooltip("When enabled, run analysis and report findings without applying destructive optimizations")]
+        public bool reportOnly = false;
+
+        [Space(5)]
+        public AnimatorAnalysisSettings animatorAnalysisSettings = new AnimatorAnalysisSettings();
+
+        [Space(5)]
+        public MeshAnalysisSettings meshAnalysisSettings = new MeshAnalysisSettings();
+
+        [Space(5)]
+        public BlendshapeAnalysisSettings blendshapeAnalysisSettings = new BlendshapeAnalysisSettings();
+
+        [Space(5)]
+        public PhysicsAnalysisSettings physicsAnalysisSettings = new PhysicsAnalysisSettings();
+
+        [Space(5)]
+        public ReportingSettings reportingSettings = new ReportingSettings();
         
 #if UNITY_EDITOR
         [Header("=== Debug & Statistics ===")]
@@ -40,11 +60,166 @@ namespace MilchZocker.AvatarOptimizer
             public int verticesMerged;
             public int looseVerticesRemoved;
             public int meshesCombined;
+            public int meshesModified;
             public int atlasesGenerated;
             public int textureMemorySavedMB;
             public float optimizationTimeSeconds;
+            public int analysisIssues;
+            public int analysisWarnings;
+            public int analysisInfos;
+            public string lastAnalysisReport;
         }
 #endif
+
+        [Serializable]
+        public class AnimatorAnalysisSettings
+        {
+            [Tooltip("Enable analysis of animator controllers and layer complexity")]
+            public bool enableAnalysis = true;
+
+            [Tooltip("Warn when many layers are detected in a single controller")]
+            public bool warnOnExcessiveLayers = true;
+
+            [Range(1, 32)]
+            [Tooltip("Recommended maximum layer count before warning")]
+            public int maxRecommendedLayers = 8;
+
+            [Tooltip("Warn when a controller uses an excessive number of parameters")]
+            public bool warnOnExcessiveParameters = true;
+
+            [Range(1, 100)]
+            [Tooltip("Recommended maximum parameter count before warning")]
+            public int maxRecommendedParameters = 20;
+
+            [Tooltip("Prefer lighter controller patterns for heavy toggles when possible")]
+            public bool preferDirectBlendTreesForHeavyToggles = true;
+
+            [Tooltip("Warn when a controller uses too many bool parameters for toggle-driven logic")]
+            public bool warnOnHeavyToggleSetup = true;
+
+            [Range(1, 32)]
+            [Tooltip("Recommended maximum bool-parameter count before warning")]
+            public int maxRecommendedBoolParameters = 6;
+
+            [Tooltip("Warn when a controller uses self-transitions that can make state logic harder to reason about")]
+            public bool warnOnSelfTransitions = true;
+
+            [Tooltip("Preserve CVR facial systems when evaluating animator-related changes")]
+            public bool preserveCVRFacialSafety = true;
+
+            [Tooltip("Keep analysis report-only unless explicitly enabled for auto-application")]
+            public bool reportOnly = true;
+        }
+
+        [Serializable]
+        public class MeshAnalysisSettings
+        {
+            [Tooltip("Enable analysis of meshes, material slots, and draw-call pressure")]
+            public bool enableAnalysis = true;
+
+            [Tooltip("Allow safe mesh merging when compatibility checks pass")]
+            public bool allowSafeMeshMerging = false;
+
+            [Tooltip("Allow material deduplication when compatible")]
+            public bool allowMaterialDeduplication = true;
+
+            [Range(1, 32)]
+            [Tooltip("Recommended maximum material slots before warning")]
+            public int maxRecommendedMaterialSlots = 8;
+
+            [Range(1, 64)]
+            [Tooltip("Recommended maximum mesh count before warning")]
+            public int maxRecommendedMeshCount = 12;
+
+            [Tooltip("Favor draw-call reduction when evaluating mesh changes")]
+            public bool preferDrawCallReduction = true;
+
+            [Tooltip("Keep analysis report-only unless explicitly enabled for auto-application")]
+            public bool reportOnly = true;
+        }
+
+        [Serializable]
+        public class BlendshapeAnalysisSettings
+        {
+            [Tooltip("Enable blendshape analysis and cleanup suggestions")]
+            public bool enableAnalysis = true;
+
+            [Tooltip("Protect CVR facial systems while evaluating blendshape changes")]
+            public bool preserveCVRFacialShapes = true;
+
+            [Tooltip("Remove blendshapes with nearly zero delta when safe")]
+            public bool removeZeroDeltaBlendshapes = true;
+
+            [Range(0.000001f, 0.001f)]
+            [Tooltip("Threshold below which a blendshape is considered effectively empty")]
+            public float zeroDeltaThreshold = 0.00001f;
+
+            [Tooltip("Preserve custom blendshapes that match known facial patterns")]
+            public bool preserveCustomPatterns = true;
+
+            [Tooltip("Comma-separated preserve patterns for facial or custom shapes")]
+            public string preserveBlendshapePatterns = "Blink,Viseme,EyeLook,FaceTracking";
+
+            [Tooltip("Keep analysis report-only unless explicitly enabled for auto-application")]
+            public bool reportOnly = true;
+        }
+
+        [Serializable]
+        public class PhysicsAnalysisSettings
+        {
+            [Tooltip("Enable analysis of cloth and physics-heavy components")]
+            public bool enableAnalysis = true;
+
+            [Tooltip("Warn when Magica Cloth self-collision is likely to be costly")]
+            public bool warnOnMagicaSelfCollision = true;
+
+            [Tooltip("Warn when Magica Cloth mutual collision is likely to be costly")]
+            public bool warnOnMagicaMutualCollision = true;
+
+            [Tooltip("Warn when cloth proxy meshes are unusually large")]
+            public bool warnOnHighProxyVertexCount = true;
+
+            [Range(100, 100000)]
+            [Tooltip("Recommended maximum proxy vertex count before warning")]
+            public int maxRecommendedProxyVertexCount = 4000;
+
+            [Tooltip("Warn when simulation frequency is set aggressively high")]
+            public bool warnOnHighSimulationFrequency = true;
+
+            [Range(30, 240)]
+            [Tooltip("Recommended maximum simulation frequency before warning")]
+            public int maxRecommendedSimulationFrequency = 90;
+
+            [Tooltip("Warn when Dynamic Bone setups use an excessive number of colliders")]
+            public bool warnOnDynamicBoneComplexity = true;
+
+            [Range(1, 64)]
+            [Tooltip("Recommended maximum Dynamic Bone collider count before warning")]
+            public int maxRecommendedDynamicBoneColliders = 8;
+
+            [Tooltip("Keep analysis report-only unless explicitly enabled for auto-application")]
+            public bool reportOnly = true;
+        }
+
+        [Serializable]
+        public class ReportingSettings
+        {
+            [Tooltip("Show the optimization findings summary in the inspector")]
+            public bool showOptimizationSummary = true;
+
+            [Tooltip("Show severity labels for each analysis finding")]
+            public bool showIssueSeverity = true;
+
+            [Range(1, 25)]
+            [Tooltip("Maximum number of findings to display per category")]
+            public int maxIssuesPerCategory = 10;
+
+            [Tooltip("Include recommended next actions in the report")]
+            public bool includeSuggestions = true;
+
+            [Tooltip("Label whether a finding can be auto-fixed")]
+            public bool includeAutoFixAvailability = true;
+        }
         
         [Serializable]
         public class BoneOptimizationSettings
@@ -118,8 +293,11 @@ namespace MilchZocker.AvatarOptimizer
             public bool deleteLooseVertices = true;
             
             [Space(10)]
-            [Tooltip("Combine meshes with identical materials (excludes animated meshes)")]
+            [Tooltip("Combine meshes with identical materials. Disabled for skinned avatar meshes to preserve rigging, blendshape, and bind-pose safety.")]
             public bool combineMeshes = false;
+
+            [Tooltip("Exclude the face mesh selected on the CVR Avatar component from mesh merging")]
+            public bool excludeFaceMeshFromCombine = true;
             
             [Space(10)]
             [Tooltip("Recalculate normals after optimisation")]

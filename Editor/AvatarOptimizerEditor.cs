@@ -15,6 +15,8 @@ namespace MilchZocker.AvatarOptimizer
         private SerializedProperty meshSettingsProp;
         private SerializedProperty blendshapeSettingsProp;
         private SerializedProperty atlasSettingsProp;
+        private SerializedProperty animatorSettingsProp;
+        private SerializedProperty physicsSettingsProp;
         private SerializedProperty statsProp;
 
         // Main section foldouts
@@ -105,6 +107,8 @@ namespace MilchZocker.AvatarOptimizer
             meshSettingsProp = serializedObject.FindProperty("meshSettings");
             blendshapeSettingsProp = serializedObject.FindProperty("blendshapeSettings");
             atlasSettingsProp = serializedObject.FindProperty("atlasSettings");
+            animatorSettingsProp = serializedObject.FindProperty("animatorAnalysisSettings");
+            physicsSettingsProp = serializedObject.FindProperty("physicsAnalysisSettings");
             statsProp = serializedObject.FindProperty("stats");
 
             estimatesNeedUpdate = true;
@@ -126,6 +130,15 @@ namespace MilchZocker.AvatarOptimizer
 
             EditorGUILayout.Space(8);
 
+            DrawOptimizationFindings();
+
+            EditorGUILayout.Space(4);
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("reportOnly"), new GUIContent("Report-only mode"));
+            if (serializedObject.FindProperty("reportOnly").boolValue)
+            {
+                EditorGUILayout.HelpBox("Analysis is running in report-only mode. No destructive optimization steps will be applied until this is disabled.", MessageType.Info);
+            }
+
             // Main Settings Sections
             DrawBoneSettings();
             EditorGUILayout.Space(5);
@@ -134,6 +147,12 @@ namespace MilchZocker.AvatarOptimizer
             EditorGUILayout.Space(5);
 
             DrawBlendshapeSettings();
+            EditorGUILayout.Space(5);
+
+            DrawAnimatorSettings();
+            EditorGUILayout.Space(5);
+
+            DrawPhysicsSettings();
             EditorGUILayout.Space(5);
 
             DrawAtlasSettings();
@@ -176,6 +195,41 @@ namespace MilchZocker.AvatarOptimizer
             
             GUILayout.Space(2);
             
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DrawOptimizationFindings()
+        {
+            var opt = (AvatarOptimizer)target;
+            if (opt == null || !opt.reportingSettings.showOptimizationSummary)
+            {
+                return;
+            }
+
+            var issueCount = statsProp != null ? statsProp.FindPropertyRelative("analysisIssues").intValue : 0;
+            var warningCount = statsProp != null ? statsProp.FindPropertyRelative("analysisWarnings").intValue : 0;
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.LabelField("🧠 Optimization Findings", EditorStyles.boldLabel);
+
+            if (issueCount == 0)
+            {
+                EditorGUILayout.LabelField("No issues were detected in the latest analysis pass.");
+            }
+            else
+            {
+                EditorGUILayout.LabelField($"Found {issueCount} finding(s); {warningCount} warning(s).", EditorStyles.miniBoldLabel);
+                EditorGUILayout.HelpBox("Analysis is currently report-only by default. Review the findings and enable safe auto-apply modes when ready.", MessageType.Info);
+            }
+
+            var report = statsProp != null ? statsProp.FindPropertyRelative("lastAnalysisReport").stringValue : string.Empty;
+            if (!string.IsNullOrWhiteSpace(report))
+            {
+                EditorGUILayout.Space(4);
+                EditorGUILayout.LabelField("Analysis Report", EditorStyles.miniBoldLabel);
+                EditorGUILayout.TextArea(report, GUILayout.MinHeight(120));
+            }
+
             EditorGUILayout.EndVertical();
         }
 
@@ -1346,6 +1400,10 @@ namespace MilchZocker.AvatarOptimizer
                 EditorGUILayout.Space(5);
                 DrawSubsectionLabel("Mesh Operations");
                 EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("combineMeshes"));
+                if (meshSettingsProp.FindPropertyRelative("combineMeshes").boolValue)
+                {
+                    EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("excludeFaceMeshFromCombine"));
+                }
                 EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("recalculateNormals"));
                 EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("recalculateTangents"));
 
@@ -1450,6 +1508,100 @@ namespace MilchZocker.AvatarOptimizer
         #endregion
 
         #region Atlas Settings
+
+        private void DrawAnimatorSettings()
+        {
+            var originalColor = GUI.backgroundColor;
+            GUI.backgroundColor = new Color(0.95f, 0.95f, 1f);
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            GUI.backgroundColor = originalColor;
+
+            var showAnimator = EditorGUILayout.Foldout(true, "🎬 Animator Analysis", true, EditorStyles.foldoutHeader);
+            if (showAnimator)
+            {
+                EditorGUILayout.Space(3);
+                EditorGUI.indentLevel++;
+
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("enableAnalysis"));
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("warnOnExcessiveLayers"));
+                if (animatorSettingsProp.FindPropertyRelative("warnOnExcessiveLayers").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("maxRecommendedLayers"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("warnOnExcessiveParameters"));
+                if (animatorSettingsProp.FindPropertyRelative("warnOnExcessiveParameters").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("maxRecommendedParameters"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("warnOnHeavyToggleSetup"));
+                if (animatorSettingsProp.FindPropertyRelative("warnOnHeavyToggleSetup").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("maxRecommendedBoolParameters"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("warnOnSelfTransitions"));
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("preserveCVRFacialSafety"));
+                EditorGUILayout.PropertyField(animatorSettingsProp.FindPropertyRelative("reportOnly"));
+
+                EditorGUI.indentLevel--;
+                EditorGUILayout.Space(2);
+            }
+
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DrawPhysicsSettings()
+        {
+            var originalColor = GUI.backgroundColor;
+            GUI.backgroundColor = new Color(0.95f, 0.95f, 1f);
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            GUI.backgroundColor = originalColor;
+
+            var showPhysics = EditorGUILayout.Foldout(true, "🧲 Physics Analysis", true, EditorStyles.foldoutHeader);
+            if (showPhysics)
+            {
+                EditorGUILayout.Space(3);
+                EditorGUI.indentLevel++;
+
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("enableAnalysis"));
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("warnOnMagicaSelfCollision"));
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("warnOnMagicaMutualCollision"));
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("warnOnHighProxyVertexCount"));
+                if (physicsSettingsProp.FindPropertyRelative("warnOnHighProxyVertexCount").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("maxRecommendedProxyVertexCount"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("warnOnHighSimulationFrequency"));
+                if (physicsSettingsProp.FindPropertyRelative("warnOnHighSimulationFrequency").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("maxRecommendedSimulationFrequency"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("warnOnDynamicBoneComplexity"));
+                if (physicsSettingsProp.FindPropertyRelative("warnOnDynamicBoneComplexity").boolValue)
+                {
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("maxRecommendedDynamicBoneColliders"));
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.PropertyField(physicsSettingsProp.FindPropertyRelative("reportOnly"));
+
+                EditorGUI.indentLevel--;
+                EditorGUILayout.Space(2);
+            }
+
+            EditorGUILayout.EndVertical();
+        }
 
         private void DrawAtlasSettings()
         {
