@@ -46,8 +46,8 @@ jobs:
                   return
               guid = hashlib.md5(str(path.relative_to(export_dir)).encode('utf-8')).hexdigest()
               meta_content = f'''fileFormatVersion: 2
-guid: {guid}
-'''
+          guid: {guid}
+          '''
               meta_path.write_text(meta_content, encoding='utf-8')
 
           for child in sorted(export_dir.iterdir()):
