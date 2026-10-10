@@ -1,4 +1,4 @@
-#if UNITY_EDITOR
+﻿#if UNITY_EDITOR
 
 using UnityEngine;
 using UnityEditor;
@@ -9,7 +9,7 @@ using System.Collections.Generic;
 namespace MilchZocker.AvatarOptimizer
 {
     [CustomEditor(typeof(AvatarOptimizer))]
-    public class AvatarOptimizerEditor : Editor
+    public class CVRAvatarOptimizerEditor : Editor
     {
         private SerializedProperty boneSettingsProp;
         private SerializedProperty meshSettingsProp;
@@ -22,6 +22,8 @@ namespace MilchZocker.AvatarOptimizer
         // Main section foldouts
         private bool showBoneSettings = true;
         private bool showMeshSettings = true;
+        private bool showSimplificationSettings = false;
+        private bool showMergeLimits = false;
         private bool showBlendshapeSettings = true;
         private bool showAtlasSettings = true;
         private bool showStats = true;
@@ -57,6 +59,16 @@ namespace MilchZocker.AvatarOptimizer
 
         private class EstimationData
         {
+            public class ProcessInfo
+            {
+                public string name;
+                public bool enabled;
+                public string estimate;
+                public string reason;
+            }
+
+            public List<ProcessInfo> processes = new List<ProcessInfo>();
+
             // Before optimization
             public long currentMemoryBytes;
             public int currentTextureCount;
@@ -92,6 +104,7 @@ namespace MilchZocker.AvatarOptimizer
                 public List<string> compatibleProperties = new List<string>();
                 public List<string> incompatibleProperties = new List<string>();
                 public int groupId = -1;
+                public string animatedSignature = string.Empty; // Which properties (if any) are animated together
             }
 
             public List<MaterialAtlasInfo> atlasingMaterials = new List<MaterialAtlasInfo>();
@@ -144,6 +157,9 @@ namespace MilchZocker.AvatarOptimizer
             EditorGUILayout.Space(5);
 
             DrawMeshSettings();
+            EditorGUILayout.Space(5);
+
+            DrawSimplificationSettings();
             EditorGUILayout.Space(5);
 
             DrawBlendshapeSettings();
@@ -339,6 +355,10 @@ namespace MilchZocker.AvatarOptimizer
 
                 EditorGUILayout.Space(5);
 
+                DrawProcessPlan(cachedEstimates.processes, "⚙ Process Plan");
+
+                EditorGUILayout.Space(5);
+
                 // Estimated Reductions
                 DrawEstimateSection("📉 Estimated Reductions", successColor, () =>
                 {
@@ -444,6 +464,9 @@ namespace MilchZocker.AvatarOptimizer
                 statsScrollPos = EditorGUILayout.BeginScrollView(statsScrollPos, GUILayout.MaxHeight(400));
                 
                 EditorGUI.indentLevel++;
+
+                DrawProcessPlan(BuildResultProcessPlan(opt), "⚙ Process Results");
+                EditorGUILayout.Space(5);
 
                 // Actual Operations Performed
                 DrawEstimateSection("🔧 Operations Performed", new Color(0.9f, 0.95f, 1f), () =>
@@ -558,6 +581,134 @@ namespace MilchZocker.AvatarOptimizer
             EditorGUILayout.EndVertical();
         }
 
+        private void DrawProcessPlan(IEnumerable<EstimationData.ProcessInfo> processes, string title)
+        {
+            DrawEstimateSection(title, new Color(0.88f, 0.94f, 1f), () =>
+            {
+                foreach (var process in processes)
+                {
+                    var color = process.enabled ? new Color(0.2f, 0.8f, 0.2f) : new Color(0.55f, 0.55f, 0.55f);
+                    var style = new GUIStyle(EditorStyles.boldLabel) { normal = { textColor = color } };
+                    EditorGUILayout.LabelField($"{(process.enabled ? "ON" : "OFF")}  {process.name}", style);
+                    EditorGUI.indentLevel++;
+                    EditorGUILayout.LabelField(process.estimate, EditorStyles.miniLabel);
+                    EditorGUILayout.LabelField(process.reason, EditorStyles.wordWrappedMiniLabel);
+                    EditorGUI.indentLevel--;
+                }
+            });
+        }
+
+        private List<EstimationData.ProcessInfo> BuildResultProcessPlan(AvatarOptimizer opt)
+        {
+            var processes = BuildProcessPlan(opt, null);
+            if (statsProp != null)
+            {
+                var stats = new Dictionary<string, int>
+                {
+                    ["Mesh combine"] = statsProp.FindPropertyRelative("meshesCombined")?.intValue ?? 0,
+                    ["Blendshape cleanup"] = statsProp.FindPropertyRelative("blendshapesRemoved")?.intValue ?? 0,
+                    ["Vertex cleanup"] = statsProp.FindPropertyRelative("verticesMerged")?.intValue ?? 0,
+                    ["Atlas generation"] = statsProp.FindPropertyRelative("atlasesGenerated")?.intValue ?? 0
+                };
+
+                foreach (var process in processes)
+                {
+                    if (stats.TryGetValue(process.name, out var value))
+                        process.estimate = $"Completed: {value:N0}";
+                }
+            }
+            return processes;
+        }
+
+        private List<EstimationData.ProcessInfo> BuildProcessPlan(AvatarOptimizer opt, EstimationData data)
+        {
+            var processes = new List<EstimationData.ProcessInfo>();
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Bone reference cleanup",
+                enabled = opt.boneSettings.removeUnusedBoneReferences || opt.boneSettings.removeBonesWithoutWeights,
+                estimate = data == null ? "Removes unused references while preserving required rig links" : $"Estimated removable: {data.estimatedBonesRemovable:N0}",
+                reason = "Reduces skinning data without deleting required bone objects."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Blendshape cleanup",
+                enabled = opt.blendshapeSettings.removeUnusedBlendshapes,
+                estimate = data == null ? "Preserves animated and CVR facial channels" : $"Estimated removable: {data.estimatedBlendshapesRemovable:N0}",
+                reason = "Animation curves, CVR lip sync, blink, eye look, and face tracking are treated as preservation inputs."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Vertex cleanup",
+                enabled = opt.meshSettings.mergeVerticesByDistance || opt.meshSettings.deleteLooseVertices,
+                estimate = data == null ? "Distance/normal/UV guarded cleanup" : $"Estimated mergeable: {data.estimatedVerticesMergeable:N0}",
+                reason = "Only vertices passing the configured geometric safety checks are merged."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Mesh combine",
+                enabled = opt.meshSettings.combineMeshes,
+                estimate = data == null ? "Uses compatible renderer groups" : $"Estimated renderer reduction: {data.estimatedMeshesCombineable:N0}",
+                reason = "Legacy mode requires strict compatibility; toggle mode uses clone-only relaxed grouping after successful preparation."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Toggle-preserving merge",
+                enabled = opt.meshSettings.mergeToggleObjects,
+                estimate = opt.meshSettings.toggleMergeBackend == AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend.Automatic
+                    ? "Automatic -> Infinimation Blendshape"
+                    : opt.meshSettings.toggleMergeBackend.ToString(),
+                reason = opt.meshSettings.toggleMergeBackend == AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend.Automatic
+                    ? "Selected because it adds no bones, is shader-independent, and supports clone-only blendshape animation repathing."
+                    : "Explicit backend selection; unsupported experimental backends are reported during build."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Atlas generation",
+                enabled = opt.atlasSettings.generateTextureAtlas,
+                estimate = data == null ? "Groups by shader, textures, and animation signature" : $"Estimated atlases: {data.estimatedAtlasesGenerable:N0}",
+                reason = "Animated materials are grouped by matching animated property signatures to avoid changing toggle behavior."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Standalone texture compression",
+                enabled = opt.atlasSettings.useAdaptiveCompression,
+                estimate = opt.atlasSettings.onlyReduceFileSize
+                    ? "Clone-only adaptive compression; larger estimates are skipped"
+                    : "Clone-only adaptive compression for non-atlased textures",
+                reason = "Runs standalone when atlasing is disabled; original texture assets and importer settings are never modified."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Attribute stripping",
+                enabled = opt.meshSettings.stripUnusedAttributes,
+                estimate = "Removes unused tangents, colors, lightmap UVs, and extra channels",
+                reason = "Reduces vertex-buffer memory only when the selected attributes are not required."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Material deduplication",
+                enabled = opt.meshSettings.deduplicateMaterials,
+                estimate = "Reuses identical compatible material assignments",
+                reason = "Reduces duplicate material slots without modifying source material assets."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Mesh compression and GPU optimization",
+                enabled = opt.meshSettings.optimizeMeshForRendering || opt.meshSettings.applyMeshCompression,
+                estimate = "Applies selected Unity mesh optimization and compression settings",
+                reason = "Can reduce runtime vertex/index cost or memory; quality is controlled by compression level."
+            });
+            processes.Add(new EstimationData.ProcessInfo
+            {
+                name = "Physics rebuild",
+                enabled = true,
+                estimate = "Rebuilds supported physics data after mesh and bone changes",
+                reason = "Unsupported physics integrations are skipped safely."
+            });
+            return processes;
+        }
+
         private void DrawEstimateStat(string label, string value)
         {
             EditorGUILayout.BeginHorizontal();
@@ -658,21 +809,27 @@ namespace MilchZocker.AvatarOptimizer
                 }
             }
 
+            foreach (var material in MaterialAnimationUtility.GetReferencedMaterials(avatarRoot))
+            {
+                uniqueMaterials.Add(material);
+                CollectTextures(material, uniqueTextures);
+            }
+
             // Count bones
             data.currentBoneCount = avatarRoot.GetComponentsInChildren<Transform>(true).Length;
 
-            // Estimate mergeable vertices
+            // Estimate mergeable vertices from the configured geometry guards rather than
+            // using a fixed percentage. This remains conservative but responds to mesh data.
             if (opt.meshSettings.mergeVerticesByDistance)
             {
-                data.estimatedVerticesMergeable = (int)(data.currentVertexCount * 0.15f); // ~15% typical
+                data.estimatedVerticesMergeable = EstimateMergeableVertices(meshRenderers, opt);
             }
 
-            // Estimate combineable meshes
-            if (opt.meshSettings.combineMeshes)
-            {
-                var materialGroups = meshRenderers.GroupBy(r => string.Join(",", r.sharedMaterials.Select(m => m?.name ?? "")));
-                data.estimatedMeshesCombineable = meshRenderers.Length - materialGroups.Count();
-            }
+            // Estimate combineable meshes using strict material/root/bone compatibility.
+            // Toggle-preserving mode gets a separate relaxed estimate because it can merge
+            // across materials after successful clone-only toggle preparation.
+            if (opt.meshSettings.combineMeshes || opt.meshSettings.mergeToggleObjects)
+                data.estimatedMeshesCombineable = EstimateCombineableMeshes(meshRenderers, opt);
 
             // Estimate removable blendshapes (conservative estimate)
             if (opt.blendshapeSettings.removeUnusedBlendshapes)
@@ -700,6 +857,28 @@ namespace MilchZocker.AvatarOptimizer
             if (opt.atlasSettings.generateTextureAtlas)
             {
                 data.atlasingMaterials = AnalyzeMaterialsForAtlasing(avatarRoot, opt, uniqueMaterials, out data.materialsByShader);
+
+                // Partition each shader group by animated-property signature: materials animated
+                // the same way (or both static) may atlas together, but a mismatch (different
+                // animated properties, or animated vs. not animated) keeps them apart. This must
+                // match the grouping used during actual atlas generation, or the stats shown here
+                // will overstate how many materials can really be merged.
+                foreach (var kvp in data.materialsByShader)
+                {
+                    foreach (var sigGroup in kvp.Value.Where(m => m.canAtlas).GroupBy(m => m.animatedSignature))
+                    {
+                        var sigMats = sigGroup.ToList();
+                        if (sigMats.Count < opt.atlasSettings.minimumMaterialsForAtlas)
+                        {
+                            foreach (var info in sigMats)
+                            {
+                                info.canAtlas = false;
+                                info.reasons.Add("Not enough materials sharing the same animation state");
+                            }
+                        }
+                    }
+                }
+
                 data.totalAtlasableMaterials = data.atlasingMaterials.Count(m => m.canAtlas);
                 data.totalExcludedMaterials = data.atlasingMaterials.Count(m => !m.canAtlas);
 
@@ -710,63 +889,66 @@ namespace MilchZocker.AvatarOptimizer
 
                 foreach (var kvp in data.materialsByShader)
                 {
-                    var matsForShader = kvp.Value.Where(m => m.canAtlas).ToList();
-
-                    if (matsForShader.Count < opt.atlasSettings.minimumMaterialsForAtlas)
-                        continue;
-
-                    var groupTextures = new HashSet<Texture2D>();
-
-                    foreach (var matInfo in matsForShader)
+                    foreach (var sigGroup in kvp.Value.Where(m => m.canAtlas).GroupBy(m => m.animatedSignature))
                     {
-                        foreach (var propInfo in matInfo.compatibleProperties)
+                        var matsForShader = sigGroup.ToList();
+
+                        if (matsForShader.Count < opt.atlasSettings.minimumMaterialsForAtlas)
+                            continue;
+
+                        var groupTextures = new HashSet<Texture2D>();
+
+                        foreach (var matInfo in matsForShader)
                         {
-                            var propName = propInfo.Split('(')[0].Trim();
-                            if (matInfo.material == null || !matInfo.material.HasProperty(propName))
-                                continue;
+                            foreach (var propInfo in matInfo.compatibleProperties)
+                            {
+                                var propName = propInfo.Split('(')[0].Trim();
+                                if (matInfo.material == null || !matInfo.material.HasProperty(propName))
+                                    continue;
 
-                            var tex = matInfo.material.GetTexture(propName) as Texture2D;
-                            if (tex != null)
-                                groupTextures.Add(tex);
+                                var tex = matInfo.material.GetTexture(propName) as Texture2D;
+                                if (tex != null)
+                                    groupTextures.Add(tex);
+                            }
                         }
+
+                        if (groupTextures.Count == 0)
+                            continue;
+
+                        long groupOriginalMemory = 0;
+                        foreach (var tex in groupTextures)
+                        {
+                            groupOriginalMemory += EstimateTextureSize(tex);
+                        }
+                        totalOriginalTextureMemory += groupOriginalMemory;
+
+                        int maxAtlasSize = (int)opt.atlasSettings.maxAtlasSize;
+                        int padding = opt.atlasSettings.atlasPadding;
+
+                        long totalPixels = 0;
+                        foreach (var tex in groupTextures)
+                        {
+                            int paddedWidth = tex.width + (padding * 2);
+                            int paddedHeight = tex.height + (padding * 2);
+                            totalPixels += (long)paddedWidth * paddedHeight;
+                        }
+
+                        long estimatedAtlasPixels = (long)(totalPixels / 0.75f); // assume ~75% packing efficiency
+                        int atlasSize = Mathf.NextPowerOfTwo(Mathf.CeilToInt(Mathf.Sqrt(estimatedAtlasPixels)));
+                        atlasSize = Mathf.Clamp(atlasSize, opt.atlasSettings.minimumOutputAtlasSize, maxAtlasSize);
+
+                        long estimatedAtlasMemory = (long)(atlasSize * atlasSize * 4f * 1.33f); // RGBA32 with mipmaps
+                        totalEstimatedAtlasMemory += estimatedAtlasMemory;
+
+                        int numProperties = Mathf.Max(1, matsForShader[0].compatibleProperties.Count);
+                        if (opt.atlasSettings.useEnhancedAtlasWorkflow)
+                        {
+                            numProperties = Mathf.Max(1, Mathf.RoundToInt(numProperties * 0.7f));
+                        }
+
+                        data.estimatedAtlasesGenerable += numProperties;
+                        groupId++;
                     }
-
-                    if (groupTextures.Count == 0)
-                        continue;
-
-                    long groupOriginalMemory = 0;
-                    foreach (var tex in groupTextures)
-                    {
-                        groupOriginalMemory += EstimateTextureSize(tex);
-                    }
-                    totalOriginalTextureMemory += groupOriginalMemory;
-
-                    int maxAtlasSize = (int)opt.atlasSettings.maxAtlasSize;
-                    int padding = opt.atlasSettings.atlasPadding;
-
-                    long totalPixels = 0;
-                    foreach (var tex in groupTextures)
-                    {
-                        int paddedWidth = tex.width + (padding * 2);
-                        int paddedHeight = tex.height + (padding * 2);
-                        totalPixels += (long)paddedWidth * paddedHeight;
-                    }
-
-                    long estimatedAtlasPixels = (long)(totalPixels / 0.75f); // assume ~75% packing efficiency
-                    int atlasSize = Mathf.NextPowerOfTwo(Mathf.CeilToInt(Mathf.Sqrt(estimatedAtlasPixels)));
-                    atlasSize = Mathf.Clamp(atlasSize, opt.atlasSettings.minimumOutputAtlasSize, maxAtlasSize);
-
-                    long estimatedAtlasMemory = (long)(atlasSize * atlasSize * 4f * 1.33f); // RGBA32 with mipmaps
-                    totalEstimatedAtlasMemory += estimatedAtlasMemory;
-
-                    int numProperties = Mathf.Max(1, matsForShader[0].compatibleProperties.Count);
-                    if (opt.atlasSettings.useEnhancedAtlasWorkflow)
-                    {
-                        numProperties = Mathf.Max(1, Mathf.RoundToInt(numProperties * 0.7f));
-                    }
-
-                    data.estimatedAtlasesGenerable += numProperties;
-                    groupId++;
                 }
 
                 data.estimatedTextureSavingsBytes = totalOriginalTextureMemory - totalEstimatedAtlasMemory;
@@ -784,7 +966,63 @@ namespace MilchZocker.AvatarOptimizer
             // Clamp to avoid impossible savings percentages
             data.estimatedCompressionRatio = Mathf.Clamp(data.estimatedCompressionRatio, -0.5f, 0.95f);
 
+            data.processes = BuildProcessPlan(opt, data);
+
             return data;
+        }
+
+        private int EstimateMergeableVertices(SkinnedMeshRenderer[] renderers, AvatarOptimizer opt)
+        {
+            var estimate = 0;
+            foreach (var renderer in renderers)
+            {
+                var mesh = renderer.sharedMesh;
+                if (mesh == null || mesh.vertexCount < 2)
+                    continue;
+
+                var vertices = mesh.vertices;
+                var threshold = opt.meshSettings.mergeDistance * opt.meshSettings.mergeDistance;
+                for (var index = 1; index < vertices.Length; index++)
+                {
+                    if ((vertices[index] - vertices[index - 1]).sqrMagnitude <= threshold)
+                        estimate++;
+                }
+            }
+            return estimate;
+        }
+
+        private int EstimateCombineableMeshes(SkinnedMeshRenderer[] renderers, AvatarOptimizer opt)
+        {
+            var groups = new List<List<SkinnedMeshRenderer>>();
+            foreach (var renderer in renderers.Where(item => item != null && item.sharedMesh != null))
+            {
+                if (opt.meshSettings.excludeFaceMeshFromCombine && IsFaceMeshForEstimate(renderer, opt))
+                    continue;
+
+                var group = groups.FirstOrDefault(candidate =>
+                    opt.meshSettings.mergeToggleObjects ||
+                    (candidate[0].rootBone == renderer.rootBone &&
+                     candidate[0].sharedMaterials.SequenceEqual(renderer.sharedMaterials)));
+                if (group == null)
+                {
+                    group = new List<SkinnedMeshRenderer>();
+                    groups.Add(group);
+                }
+                group.Add(renderer);
+            }
+            return groups.Sum(group => Mathf.Max(0, group.Count - 1));
+        }
+
+        private bool IsFaceMeshForEstimate(SkinnedMeshRenderer renderer, AvatarOptimizer opt)
+        {
+            var avatar = opt.GetComponent("CVRAvatar");
+            return avatar != null && renderer == GetObjectMember<SkinnedMeshRenderer>(avatar, "bodyMesh");
+        }
+
+        private T GetObjectMember<T>(UnityEngine.Object target, string memberName) where T : UnityEngine.Object
+        {
+            var field = target.GetType().GetField(memberName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            return field != null ? field.GetValue(target) as T : null;
         }
 
         private int GetUsedBoneCount(Mesh mesh)
@@ -803,6 +1041,10 @@ namespace MilchZocker.AvatarOptimizer
             return usedBones.Count;
         }
 
+        // Sentinel signature for materials that aren't animated at all, distinct from
+        // the empty string used when animation-awareness is disabled entirely.
+        private const string NotAnimatedSignature = "\u0002__static__";
+
         /// <summary>
         /// Analyze materials for atlasing compatibility (editor-time analysis)
         /// </summary>
@@ -814,6 +1056,14 @@ namespace MilchZocker.AvatarOptimizer
         {
             var results = new List<EstimationData.MaterialAtlasInfo>();
             materialsByShader = new Dictionary<string, List<EstimationData.MaterialAtlasInfo>>();
+
+            // Scan for materials animated together (e.g. a Hue Shift applied via animator curves)
+            // so materials sharing the same animated properties can still be grouped for atlasing.
+            Dictionary<Material, List<string>> animatedMaterialProperties = null;
+            {
+                var avatarComponent = MaterialAnimationUtility.FindCvrAvatarComponent(avatarRoot);
+                animatedMaterialProperties = MaterialAnimationUtility.CollectAnimatedMaterialProperties(avatarRoot, avatarComponent);
+            }
 
             foreach (var mat in allMaterials)
             {
@@ -827,6 +1077,28 @@ namespace MilchZocker.AvatarOptimizer
                     shaderName = mat.shader.name,
                     canAtlas = true
                 };
+
+                // Record the animated-property signature (used for grouping below). Materials
+                // animated with the same properties can still atlas together; only a mismatch
+                // (different properties, or animated vs. not) excludes materials from merging.
+                if (animatedMaterialProperties != null)
+                {
+                    if (animatedMaterialProperties.TryGetValue(mat, out var animatedProps) && animatedProps.Count > 0)
+                    {
+                        info.animatedSignature = string.Join(",", animatedProps.OrderBy(p => p, System.StringComparer.Ordinal));
+                    }
+                    else
+                    {
+                        info.animatedSignature = NotAnimatedSignature;
+                    }
+
+                    if (animatedMaterialProperties.TryGetValue(mat, out var unsafeProperties) &&
+                        unsafeProperties.Contains(MaterialAnimationUtility.MaterialReferenceProperty))
+                    {
+                        info.canAtlas = false;
+                        info.reasons.Add("Material reference is animated");
+                    }
+                }
 
                 // Check shader filtering
                 if (!ShouldIncludeShader(mat.shader, opt))
@@ -1403,7 +1675,46 @@ namespace MilchZocker.AvatarOptimizer
                 if (meshSettingsProp.FindPropertyRelative("combineMeshes").boolValue)
                 {
                     EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("excludeFaceMeshFromCombine"));
+                    EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("preserveBlendshapesWhenCombining"));
                 }
+
+                EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("mergeToggleObjects"));
+                if (meshSettingsProp.FindPropertyRelative("mergeToggleObjects").boolValue)
+                {
+                    EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("excludeFaceMeshFromToggleMerge"));
+                    EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("toggleMergeBackend"));
+                    var backend = (AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend)
+                        meshSettingsProp.FindPropertyRelative("toggleMergeBackend").enumValueIndex;
+                    if (backend != AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend.Automatic &&
+                        backend != AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend.InfinimationBlendshape)
+                    {
+                        EditorGUILayout.HelpBox(
+                            "This toggle-preserving backend is not implemented for this package yet. " +
+                            "Use Infinimation Blendshape for the supported path.",
+                            MessageType.Warning);
+                    }
+                    else if (backend == AvatarOptimizer.MeshOptimizationSettings.ToggleMergeBackend.Automatic)
+                    {
+                        EditorGUILayout.HelpBox(
+                            "Automatic currently selects Infinimation Blendshape: it preserves toggles without adding bones or requiring a shader-specific discard path.",
+                            MessageType.Info);
+                    }
+                }
+                showMergeLimits = EditorGUILayout.Foldout(showMergeLimits, "Merge Limits & Preview", true);
+                if (showMergeLimits)
+                {
+                    EditorGUI.indentLevel++;
+                    DrawSettingsContents(serializedObject.FindProperty("mergeBudgetSettings"));
+                    if (GUILayout.Button("Preview merge plan"))
+                    {
+                        // Include edits from this inspector event in the preview.
+                        serializedObject.ApplyModifiedProperties();
+                        EditorUtility.DisplayDialog("Merge plan (estimates, not measured GPU timings)",
+                            GuardedAvatarPasses.DescribeMergePlan((AvatarOptimizer)target), "Close");
+                    }
+                    EditorGUI.indentLevel--;
+                }
+                EditorGUILayout.Space(5);
                 EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("recalculateNormals"));
                 EditorGUILayout.PropertyField(meshSettingsProp.FindPropertyRelative("recalculateTangents"));
 
@@ -1450,6 +1761,69 @@ namespace MilchZocker.AvatarOptimizer
 
         #endregion
 
+        #region Simplification Settings
+
+        private void DrawSettingsContents(SerializedProperty settings)
+        {
+            var property = settings.Copy();
+            var end = property.GetEndProperty();
+            bool enterChildren = true;
+            while (property.NextVisible(enterChildren) && !SerializedProperty.EqualContents(property, end))
+            {
+                if (settings.name == "simplificationSettings" && property.name == "backend") DrawBackendSelector(property);
+                else EditorGUILayout.PropertyField(property, true);
+                enterChildren = false;
+            }
+        }
+
+        private void DrawBackendSelector(SerializedProperty property)
+        {
+            var rect = EditorGUILayout.GetControlRect();
+            rect = EditorGUI.PrefixLabel(rect, new GUIContent("Backend"));
+            if (EditorGUI.DropdownButton(rect, new GUIContent(property.stringValue), FocusType.Keyboard))
+            {
+                var menu = new GenericMenu();
+                var path = property.propertyPath;
+                foreach (var backend in new[] { "UnityMeshSimplifier", "Meshia" })
+                {
+                    var label = new GUIContent(backend);
+                    if (!GuardedAvatarPasses.BackendAvailable(backend, out var reason))
+                        menu.AddDisabledItem(new GUIContent(backend + " (unavailable)", reason), property.stringValue == backend);
+                    else menu.AddItem(label, property.stringValue == backend, () =>
+                    {
+                        serializedObject.Update();
+                        serializedObject.FindProperty(path).stringValue = backend;
+                        serializedObject.ApplyModifiedProperties();
+                        estimatesNeedUpdate = true;
+                    });
+                }
+                menu.DropDown(rect);
+            }
+            if (!GuardedAvatarPasses.BackendAvailable(property.stringValue, out var selectedReason))
+                EditorGUILayout.HelpBox(selectedReason + " This selection will be skipped without falling back.", MessageType.Warning);
+            if (property.stringValue != "Meshia" && !GuardedAvatarPasses.BackendAvailable("Meshia", out var meshiaReason))
+                EditorGUILayout.HelpBox(meshiaReason, MessageType.Info);
+        }
+
+        private void DrawSimplificationSettings()
+        {
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            showSimplificationSettings = EditorGUILayout.Foldout(showSimplificationSettings, "Simplification", true, EditorStyles.foldoutHeader);
+            if (showSimplificationSettings)
+            {
+                EditorGUI.indentLevel++;
+                DrawSubsectionLabel("Mesh Simplification");
+                DrawSettingsContents(serializedObject.FindProperty("simplificationSettings"));
+                EditorGUILayout.Space(5);
+                DrawSubsectionLabel("Rig Reduction");
+                DrawSettingsContents(serializedObject.FindProperty("rigReductionSettings"));
+                EditorGUI.indentLevel--;
+            }
+            EditorGUILayout.EndVertical();
+        }
+
+        #endregion
+
         #region Blendshape Settings
 
         private void DrawBlendshapeSettings()
@@ -1468,6 +1842,7 @@ namespace MilchZocker.AvatarOptimizer
                 EditorGUI.indentLevel++;
 
                 EditorGUILayout.PropertyField(blendshapeSettingsProp.FindPropertyRelative("removeUnusedBlendshapes"));
+                EditorGUILayout.PropertyField(blendshapeSettingsProp.FindPropertyRelative("bakeConstantBlendshapes"));
 
                 if (blendshapeSettingsProp.FindPropertyRelative("removeUnusedBlendshapes").boolValue)
                 {
@@ -1611,14 +1986,21 @@ namespace MilchZocker.AvatarOptimizer
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             GUI.backgroundColor = originalColor;
 
-            showAtlasSettings = EditorGUILayout.Foldout(showAtlasSettings, "🎨 Texture Atlas Generation", true, EditorStyles.foldoutHeader);
+            showAtlasSettings = EditorGUILayout.Foldout(showAtlasSettings, "🎨 Texture Optimization", true, EditorStyles.foldoutHeader);
 
             if (showAtlasSettings)
             {
                 EditorGUILayout.Space(3);
                 EditorGUI.indentLevel++;
 
+                DrawSubsectionLabel("Atlas Generation");
                 EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("generateTextureAtlas"));
+
+                EditorGUILayout.Space(5);
+                DrawAtlasSubsection("UV Packing & Material Swaps", infoColor, () =>
+                {
+                    DrawSettingsContents(serializedObject.FindProperty("surfaceSettings"));
+                });
 
                 if (atlasSettingsProp.FindPropertyRelative("generateTextureAtlas").boolValue)
                 {
@@ -1680,9 +2062,6 @@ namespace MilchZocker.AvatarOptimizer
                     DrawPerPropertyControlSettings();
 
                     EditorGUILayout.Space(5);
-                    DrawAdaptiveCompressionSettings();
-
-                    EditorGUILayout.Space(5);
                     DrawAdvancedAtlasSettings();
 
                     EditorGUILayout.Space(5);
@@ -1700,6 +2079,9 @@ namespace MilchZocker.AvatarOptimizer
                     EditorGUILayout.Space(5);
                     EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("verboseLogging"));
                 }
+
+                EditorGUILayout.Space(5);
+                DrawAdaptiveCompressionSettings();
 
                 EditorGUI.indentLevel--;
                 EditorGUILayout.Space(2);
@@ -1763,15 +2145,16 @@ namespace MilchZocker.AvatarOptimizer
         private void DrawAdaptiveCompressionSettings()
         {
             EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
-
-            var foldoutStyle = new GUIStyle(EditorStyles.foldout) { fontStyle = FontStyle.Bold };
-            showAdaptiveCompression = EditorGUILayout.Foldout(showAdaptiveCompression, "⚙️ Adaptive Compression", true, foldoutStyle);
-
-            if (showAdaptiveCompression)
+            DrawAtlasSubsection("⚙️ Adaptive Texture Compression", new Color(0.9f, 0.96f, 1f), () =>
             {
                 EditorGUI.indentLevel++;
 
                 EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("useAdaptiveCompression"));
+                if (atlasSettingsProp.FindPropertyRelative("useAdaptiveCompression").boolValue)
+                {
+                    EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("onlyReduceFileSize"));
+                    EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("automaticFilterModes"));
+                }
                 EditorGUILayout.PropertyField(atlasSettingsProp.FindPropertyRelative("verboseDensityLogging"));
 
                 EditorGUILayout.Space(3);
@@ -1808,7 +2191,7 @@ namespace MilchZocker.AvatarOptimizer
                 }
 
                 EditorGUI.indentLevel--;
-            }
+            });
         }
 
         private void DrawAdvancedAtlasSettings()
@@ -1997,6 +2380,643 @@ namespace MilchZocker.AvatarOptimizer
         }
 
         #endregion
+    }
+}
+
+namespace MilchZocker.AvatarOptimizer
+{
+    /// <summary>Explicit, repeatable Editor checks; never runs during import or avatar builds.</summary>
+    public static class CVRAvatarOptimizerValidation
+    {
+        [MenuItem("Tools/Avatar Optimizer/Run optimizer regression checks")]
+        public static void RunRegressionChecks()
+        {
+            var results = new List<string>();
+            var owned = new List<UnityEngine.Object>();
+            var root = new GameObject("Optimizer regression fixture");
+            root.SetActive(false);
+            owned.Add(root);
+            try
+            {
+                var opt = root.AddComponent<AvatarOptimizer>();
+                var child = new GameObject("Accessory"); child.transform.SetParent(root.transform, false);
+                var renderer = child.AddComponent<SkinnedMeshRenderer>();
+                var bone = new GameObject("Bone"); bone.transform.SetParent(root.transform, false);
+                var mesh = new Mesh { name = "Regression triangle", vertices = new[] { Vector3.zero, Vector3.right, Vector3.up },
+                    triangles = new[] { 0, 1, 2 }, uv = new[] { Vector2.zero, Vector2.right, Vector2.up },
+                    normals = new[] { Vector3.forward, Vector3.forward, Vector3.forward },
+                    bindposes = new[] { Matrix4x4.identity, Matrix4x4.identity } };
+                owned.Add(mesh); renderer.sharedMesh = mesh; renderer.bones = new[] { bone.transform, bone.transform };
+                var material = new Material(Shader.Find("Standard")); owned.Add(material); renderer.sharedMaterial = material;
+                var unlit = new Material(Shader.Find("Unlit/Texture")); owned.Add(unlit);
+                renderer.sharedMaterial = unlit;
+                Check(GuardedAvatarPasses.GeometryExclusion(opt, renderer) == null, "geometry eligibility does not depend on Standard shader", results);
+                Check(GuardedAvatarPasses.RendererMergeRejection(opt, renderer) == null, "opaque custom shader is not rejected by shader identity", results);
+                var constraint = bone.AddComponent<UnityEngine.Animations.ParentConstraint>();
+                constraint.AddSource(new UnityEngine.Animations.ConstraintSource { sourceTransform = bone.transform, weight = 1 });
+                Check(GuardedAvatarPasses.GeometryExclusion(opt, renderer) == null, "constraints referencing renderer bones do not block geometry", results);
+                UnityEngine.Object.DestroyImmediate(constraint);
+                var clothObject = new GameObject("Other cloth"); clothObject.transform.SetParent(root.transform, false);
+                var clothRenderer = clothObject.AddComponent<SkinnedMeshRenderer>(); clothRenderer.sharedMesh = mesh;
+                var cloth = clothObject.AddComponent<Cloth>();
+                Check(GuardedAvatarPasses.MeshClothDependency(opt, clothRenderer) != null, "Unity Cloth protects its target", results);
+                Check(GuardedAvatarPasses.GeometryExclusion(opt, renderer) == null, "unrelated cloth sharing a mesh asset does not block renderer", results);
+                UnityEngine.Object.DestroyImmediate(clothObject);
+                var magicaType = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("MagicaCloth2.MagicaCloth")).FirstOrDefault(t => t != null);
+                if (magicaType != null)
+                {
+                    var clothHost = new GameObject("Magica fixture"); clothHost.transform.SetParent(root.transform, false);
+                    var magica = clothHost.AddComponent(magicaType);
+                    var serializedCloth = new SerializedObject(magica);
+                    var kind = serializedCloth.FindProperty("serializeData.clothType");
+                    var sources = serializedCloth.FindProperty("serializeData.sourceRenderers");
+                    sources.arraySize = 1; sources.GetArrayElementAtIndex(0).objectReferenceValue = renderer;
+                    kind.enumValueIndex = Array.IndexOf(kind.enumNames, "MeshCloth"); serializedCloth.ApplyModifiedPropertiesWithoutUndo();
+                    Check(GuardedAvatarPasses.MeshClothDependency(opt, renderer) != null, "Magica MeshCloth protects referenced renderer", results);
+                    sources.GetArrayElementAtIndex(0).objectReferenceValue = null; serializedCloth.ApplyModifiedPropertiesWithoutUndo();
+                    Check(GuardedAvatarPasses.GeometryExclusion(opt, renderer) == null, "unrelated Magica MeshCloth does not block geometry", results);
+                    sources.GetArrayElementAtIndex(0).objectReferenceValue = renderer;
+                    kind.enumValueIndex = Array.IndexOf(kind.enumNames, "BoneCloth"); serializedCloth.ApplyModifiedPropertiesWithoutUndo();
+                    Check(GuardedAvatarPasses.GeometryExclusion(opt, renderer) == null, "Magica BoneCloth does not block geometry", results);
+                    UnityEngine.Object.DestroyImmediate(clothHost);
+                }
+                Check(!GuardedAvatarPasses.BackendAvailable("Unknown", out _), "unknown backend is unavailable", results);
+                if (GuardedAvatarPasses.BackendAvailable("Meshia", out var missingMeshia))
+                {
+                    var grid = new Mesh { name = "Backend grid" }; owned.Add(grid);
+                    var vertices = new List<Vector3>(); var uv = new List<Vector2>(); var triangles = new List<int>();
+                    for (int y = 0; y <= 8; y++) for (int x = 0; x <= 8; x++)
+                    { vertices.Add(new Vector3(x / 8f, y / 8f, 0)); uv.Add(new Vector2(x / 8f, y / 8f)); }
+                    for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++)
+                    { int i = y * 9 + x; triangles.AddRange(new[] { i, i + 1, i + 9, i + 1, i + 10, i + 9 }); }
+                    grid.SetVertices(vertices); grid.SetUVs(0, uv); grid.SetTriangles(triangles, 0); grid.RecalculateNormals();
+                    var gridDelta = Enumerable.Repeat(Vector3.forward * 0.01f, vertices.Count).ToArray();
+                    grid.AddBlendShapeFrame("Expression", 50, gridDelta, null, null);
+                    grid.AddBlendShapeFrame("Expression", 100, gridDelta.Select(v => v * 2).ToArray(), null, null);
+                    var candidate = GuardedAvatarPasses.CreateSimplificationCandidate(grid, "Meshia", 0.75f); owned.Add(candidate);
+                    Check(candidate.triangles.Length < grid.triangles.Length && grid.vertexCount == 81 && grid.triangles.Length == 384,
+                        "Meshia reduces grid without changing original", results);
+                    Check(GuardedAvatarPasses.StreamsCompatible(grid, candidate), "Meshia preserves multi-frame shape and stream layout", results);
+                    renderer.sharedMesh = grid;
+                    Check(GuardedAvatarPasses.ValidatePoses(opt, renderer, candidate, 0.001f, false, out var poseReason),
+                        "Meshia grid passes expression pose validation: " + poseReason, results);
+                    renderer.sharedMesh = mesh;
+                }
+                else
+                {
+                    bool rejected = false;
+                    try { var unexpected = GuardedAvatarPasses.CreateSimplificationCandidate(mesh, "Meshia", 0.75f); owned.Add(unexpected); }
+                    catch (InvalidOperationException) { rejected = true; }
+                    Check(rejected, "unavailable Meshia refuses generation without fallback", results);
+                    results.Add("SKIP: Meshia generation: " + missingMeshia);
+                }
+                opt.surfaceSettings.shaderProfiles = new[] { new AvatarOptimizer.SurfaceShaderProfile {
+                    shader = unlit.shader, uv0Textures = "_MainTex" } };
+                GuardedAvatarPasses.SurfaceTextureUsage(opt, unlit, true, out var customUv, out var independentUv, out var unusedUv);
+                Check(customUv.Contains("_MainTex") && independentUv.Count == 0 && unusedUv.Count == 0, "custom shader UV contract accepted without feature-name guesses", results);
+                opt.surfaceSettings.shaderProfiles[0].independentTextures = "_MainTex";
+                bool rejectedConflict = false;
+                try { GuardedAvatarPasses.SurfaceTextureUsage(opt, unlit, true, out _, out _, out _); }
+                catch (InvalidOperationException) { rejectedConflict = true; }
+                Check(rejectedConflict, "conflicting UV mapping rejected", results);
+                opt.surfaceSettings.shaderProfiles = Array.Empty<AvatarOptimizer.SurfaceShaderProfile>();
+                var lilShader = Shader.Find("lilToon");
+                if (lilShader != null)
+                {
+                    var lil = new Material(lilShader); owned.Add(lil);
+                    GuardedAvatarPasses.SurfaceTextureUsage(opt, lil, true, out var lilUv, out var lilIndependent, out var lilUnused);
+                    Check(lilUv.Contains("_MainTex") && lilUnused.Contains("_BumpMap"), "lilToon main UV mapping and disabled normal feature recognized", results);
+                    lil.SetFloat("_ShadowColorType", 1);
+                    GuardedAvatarPasses.SurfaceTextureUsage(opt, lil, true, out lilUv, out lilIndependent, out _);
+                    Check(!lilUv.Contains("_ShadowColorTex") && lilIndependent.Contains("_ShadowColorTex"), "lilToon shadow lookup texture stays outside UV atlas", results);
+                    lil.SetVector("_MainTex_ScrollRotate", new Vector4(1, 0, 0, 0));
+                    bool rejectedAnimatedUv = false;
+                    try { GuardedAvatarPasses.SurfaceTextureUsage(opt, lil, true, out _, out _, out _); }
+                    catch (InvalidOperationException) { rejectedAnimatedUv = true; }
+                    Check(rejectedAnimatedUv, "lilToon UV animation requires dedicated handling", results);
+                }
+                else results.Add("SKIP: lilToon integration checks (shader not installed in this project)");
+                renderer.sharedMaterial = material;
+                var weights = Enumerable.Range(0, 3).Select(_ => new List<BoneWeight1> {
+                    new BoneWeight1 { boneIndex = 0, weight = 0.6f }, new BoneWeight1 { boneIndex = 1, weight = 0.4f } }).ToList();
+                GuardedAvatarPasses.WriteWeights(mesh, weights);
+                var zero = new Vector3[3]; var delta = Enumerable.Repeat(Vector3.forward, 3).ToArray();
+                mesh.AddBlendShapeFrame("AccessoryOffset", 100, delta, zero, zero);
+                renderer.SetBlendShapeWeight(0, 50);
+                Check(GuardedAvatarPasses.CanBakeShape(opt, renderer, 0), "unreferenced single-frame constant eligible", results);
+                var processor = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(AvatarOptimizationProcessor));
+                var copyMethod = typeof(AvatarOptimizationProcessor).GetMethod("CopyMeshWithoutBlendshapes", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                foreach (float weight in new[] { 50f, -25f, 150f })
+                {
+                    renderer.SetBlendShapeWeight(0, weight);
+                    var baked = (Mesh)copyMethod.Invoke(processor, new object[] { renderer, mesh, new List<int> { 0 } }); owned.Add(baked);
+                    Check(Mathf.Abs(baked.vertices[0].z - weight / 100f) < 0.00001f && baked.blendShapeCount == 0,
+                        "constant baking weight " + weight, results);
+                    Check(mesh.vertices[0] == Vector3.zero && mesh.blendShapeCount == 1, "source mesh unchanged", results);
+                }
+                mesh.AddBlendShapeFrame("MultipleFrames", 50, delta, zero, zero);
+                mesh.AddBlendShapeFrame("MultipleFrames", 100, delta, zero, zero);
+                renderer.SetBlendShapeWeight(1, 25);
+                Check(!GuardedAvatarPasses.CanBakeShape(opt, renderer, 1), "nonzero multi-frame shape excluded", results);
+                opt.blendshapeSettings.preserveBlendshapePatterns = "AccessoryOffset";
+                Check(!GuardedAvatarPasses.CanBakeShape(opt, renderer, 0), "explicit preserve rule wins", results);
+                opt.blendshapeSettings.preserveBlendshapePatterns = "";
+                opt.rigReductionSettings.mergeEquivalentBoneReferences = true;
+                GuardedAvatarPasses.ProcessRigAndSimplification(opt, _ => { });
+                Check(renderer.sharedMesh != mesh && renderer.bones.Length == 1 && bone != null, "equivalent references merged without deleting bone", results);
+                owned.Add(renderer.sharedMesh);
+                Check(GuardedAvatarPasses.ReadWeights(renderer.sharedMesh).All(w => w.Count == 1 && Mathf.Abs(w[0].weight - 1) < 0.00001f), "merged weights normalized", results);
+                Check(mesh.bindposes.Length == 2, "source bind poses unchanged", results);
+                var many = UnityEngine.Object.Instantiate(mesh); owned.Add(many);
+                many.bindposes = Enumerable.Repeat(Matrix4x4.identity, 6).ToArray();
+                GuardedAvatarPasses.WriteWeights(many, Enumerable.Range(0, 3).Select(_ => Enumerable.Range(0, 6)
+                    .Select(i => new BoneWeight1 { boneIndex = i, weight = 1f / 6 }).ToList()).ToList());
+                Check(GuardedAvatarPasses.HasManyWeights(many) && GuardedAvatarPasses.ReadWeights(many).All(w => w.Count == 6), "six-weight stream retained", results);
+                var previousMesh = renderer.sharedMesh; var previousBones = renderer.bones;
+                renderer.sharedMesh = many;
+                renderer.bones = Enumerable.Range(0, 6).Select(i =>
+                {
+                    var obj = new GameObject("ValidationBone" + i); obj.transform.SetParent(root.transform, false); return obj.transform;
+                }).ToArray();
+                var reducedWeights = UnityEngine.Object.Instantiate(many); owned.Add(reducedWeights);
+                GuardedAvatarPasses.WriteWeights(reducedWeights, Enumerable.Range(0, 3).Select(_ => new List<BoneWeight1> {
+                    new BoneWeight1 { boneIndex = 0, weight = 1 } }).ToList());
+                var previousQuality = QualitySettings.skinWeights;
+                try
+                {
+                    QualitySettings.skinWeights = SkinWeights.OneBone;
+                    Check(GuardedAvatarPasses.ValidatePoses(opt, renderer, many, .001f, true, out _), "identical variable-weight mesh passes pose samples", results);
+                    Check(!GuardedAvatarPasses.ValidatePoses(opt, renderer, reducedWeights, .001f, true, out _), "lossy weights rejected across generic bends", results);
+                    Check(QualitySettings.skinWeights == SkinWeights.OneBone, "pose validation restores editor skinning quality", results);
+                }
+                finally { QualitySettings.skinWeights = previousQuality; renderer.sharedMesh = previousMesh; renderer.bones = previousBones; }
+                Check(GuardedAvatarPasses.SurfaceWithin(mesh, mesh, 0.001f, 5), "identical surface accepted", results);
+                var displaced = UnityEngine.Object.Instantiate(mesh); owned.Add(displaced);
+                displaced.vertices = mesh.vertices.Select(v => v + Vector3.forward).ToArray();
+                Check(!GuardedAvatarPasses.SurfaceWithin(mesh, displaced, 0.001f, 5), "displaced surface rejected", results);
+                var distorted = UnityEngine.Object.Instantiate(mesh); owned.Add(distorted);
+                distorted.uv = mesh.uv.Select(v => v + Vector2.one).ToArray();
+                Check(!GuardedAvatarPasses.AttributesWithin(mesh, distorted, opt.simplificationSettings), "UV distortion rejected", results);
+                Check(GuardedAvatarPasses.RendererMergeRejection(opt, renderer) == null, "authored blendshapes eligible for stream-preserving merge", results);
+                opt.reportOnly = true;
+                var unchanged = renderer.sharedMesh;
+                GuardedAvatarPasses.ProcessRigAndSimplification(opt, _ => { });
+                GuardedAvatarPasses.ProcessSurfaces(opt, _ => { }, _ => { throw new Exception("report-only rewrote clips"); });
+                Check(renderer.sharedMesh == unchanged, "report-only leaves renderer unchanged", results);
+                opt.reportOnly = false;
+                var texture = new Texture2D(16, 16); owned.Add(texture);
+                material.SetTexture("_BumpMap", texture); material.DisableKeyword("_NORMALMAP");
+                var alternate = new Material(material) { name = "Alternate" }; owned.Add(alternate);
+                var baseClip = new AnimationClip { name = "Base" }; owned.Add(baseClip);
+                var swapClip = new AnimationClip { name = "Selected override" }; owned.Add(swapClip);
+                var slotBinding = EditorCurveBinding.PPtrCurve("Accessory", typeof(SkinnedMeshRenderer), "m_Materials.Array.data[0]");
+                AnimationUtility.SetObjectReferenceCurve(swapClip, slotBinding, new[] {
+                    new ObjectReferenceKeyframe { time = 0, value = material }, new ObjectReferenceKeyframe { time = 1, value = alternate } });
+                var controller = new UnityEditor.Animations.AnimatorController(); owned.Add(controller); controller.AddLayer("Base");
+                owned.Add(controller.layers[0].stateMachine);
+                var state = controller.layers[0].stateMachine.AddState("Swap"); owned.Add(state); state.motion = baseClip;
+                var overrides = new AnimatorOverrideController(controller); owned.Add(overrides); overrides[baseClip] = swapClip;
+                var animator = root.AddComponent<Animator>(); animator.runtimeAnimatorController = overrides;
+                Check(GuardedAvatarPasses.Clips(opt).Any(u => u.clip == swapClip), "selected override clip inventoried", results);
+                opt.surfaceSettings.removeUnusedTextures = true;
+                AnimationClip rewritten = null;
+                GuardedAvatarPasses.ProcessSurfaces(opt, message => results.Add(message), transform => rewritten = transform(swapClip));
+                Check(rewritten != null && renderer.sharedMaterial != material, "material variants and swap clip copied", results);
+                owned.Add(rewritten); owned.Add(renderer.sharedMesh); owned.Add(renderer.sharedMaterial);
+                var newKeys = AnimationUtility.GetObjectReferenceCurve(rewritten, slotBinding);
+                foreach (var key in newKeys) if (key.value != null) owned.Add(key.value);
+                Check(newKeys.All(k => k.value is Material m && m.GetTexture("_BumpMap") == null), "unused feature texture removed from every variant", results);
+                Check(material.GetTexture("_BumpMap") == texture && AnimationUtility.GetObjectReferenceCurve(swapClip, slotBinding)[1].value == alternate,
+                    "source material and swap keys unchanged", results);
+                var graphCopies = new Dictionary<UnityEngine.Object, UnityEngine.Object>();
+                var cloneGraph = typeof(AvatarOptimizationProcessor).GetMethod("CloneAnimationGraph", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var copiedOverride = (AnimatorOverrideController)cloneGraph.Invoke(processor, new object[] {
+                    overrides, new Dictionary<AnimationClip, AnimationClip> { { swapClip, rewritten } }, graphCopies, "_Regression" });
+                owned.AddRange(graphCopies.Values);
+                var copiedBase = (UnityEditor.Animations.AnimatorController)copiedOverride.runtimeAnimatorController;
+                Check(copiedOverride != overrides && copiedBase != controller && copiedBase.layers[0].stateMachine != controller.layers[0].stateMachine,
+                    "override and base animator graphs independently copied", results);
+                Check(copiedOverride[baseClip] == rewritten && overrides[baseClip] == swapClip,
+                    "copied override uses updated clip while original remains unchanged", results);
+                Check(copiedBase.layers[0].stateMachine.states[0].state != state && state.motion == baseClip,
+                    "animator states detached from original graph", results);
+                // Layout families use one set of island rectangles for every variant/map.
+                var islandMethod = typeof(GuardedAvatarPasses).GetMethod("BuildIslands", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                var layoutMethod = typeof(GuardedAvatarPasses).GetMethod("LayoutIslands", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                var islands = islandMethod.Invoke(null, new object[] { new[] { 0, 1, 2, 3, 4, 5 }, new[] {
+                    new Vector2(.1f,.1f), new Vector2(.15f,.1f), new Vector2(.1f,.15f),
+                    new Vector2(.8f,.8f), new Vector2(.85f,.8f), new Vector2(.8f,.85f) }, 512, 512 });
+                int atlasSize = (int)layoutMethod.Invoke(null, new[] { islands, (object)512, 8 });
+                Check(((System.Collections.IList)islands).Count == 2 && atlasSize > 0 && atlasSize < 512, "disconnected sampled islands pack below source size", results);
+                opt.surfaceSettings.atlasMaterialSwaps = true;
+                var tiled = new Material(material); owned.Add(tiled);
+                tiled.SetTexture("_MainTex", texture); tiled.SetTextureScale("_MainTex", Vector2.one * 2);
+                texture.wrapMode = TextureWrapMode.Clamp;
+                renderer.sharedMaterial = tiled;
+                animator.runtimeAnimatorController = null;
+                opt.surfaceSettings.packUvIslands = true;
+                unchanged = renderer.sharedMesh;
+                GuardedAvatarPasses.ProcessSurfaces(opt, _ => { }, _ => { });
+                Check(renderer.sharedMesh == unchanged && renderer.sharedMaterial == tiled, "unsupported texture tiling leaves original assignment", results);
+                RunMergeRegressionChecks(results, owned);
+                RunCompressionClipRegressionChecks(results, owned);
+                results.Add("PASS: " + results.Count(r => r.StartsWith("PASS:", StringComparison.Ordinal)) + " assertions; Unity " + Application.unityVersion);
+            }
+            catch (Exception ex) { results.Add("FAIL: " + ex); throw; }
+            finally
+            {
+                foreach (var obj in owned) if (obj != null) UnityEngine.Object.DestroyImmediate(obj);
+                WriteReport("guarded-pass-regressions.txt", results);
+            }
+        }
+
+        private static void RunCompressionClipRegressionChecks(List<string> results, List<UnityEngine.Object> owned)
+        {
+            var ctor = typeof(nadena.dev.ndmf.BuildContext).GetConstructor(new[] { typeof(GameObject), typeof(string), typeof(bool) });
+            if (ctor == null) { results.Add("SKIP: compression clip registration requires real BuildContext"); return; }
+            var root = new GameObject("Compression clip regression"); root.SetActive(false); owned.Add(root);
+            var opt = root.AddComponent<AvatarOptimizer>();
+            // A shader without texture properties isolates material-key rewriting from compression quality.
+            var material = new Material(Shader.Find("Unlit/Color")); owned.Add(material);
+            var replacementMaterial = new Material(material); owned.Add(replacementMaterial);
+            var baseClip = new AnimationClip { name = "Compression base" }; owned.Add(baseClip);
+            var swapClip = new AnimationClip { name = "Compression override" }; owned.Add(swapClip);
+            var unchanged = new AnimationClip { name = "Unchanged" }; owned.Add(unchanged);
+            var bindings = new[] { 0, 1 }.Select(slot => EditorCurveBinding.PPtrCurve("Mesh", typeof(SkinnedMeshRenderer),
+                "m_Materials.Array.data[" + slot + "]")).ToArray();
+            foreach (var clip in new[] { baseClip, swapClip })
+                foreach (var binding in bindings)
+                    AnimationUtility.SetObjectReferenceCurve(clip, binding,
+                        new[] { new ObjectReferenceKeyframe { time = 0, value = material } });
+            var controller = new UnityEditor.Animations.AnimatorController { name = "Compression controller" }; owned.Add(controller);
+            controller.AddLayer("Base"); var machine = controller.layers[0].stateMachine; owned.Add(machine);
+            var state = machine.AddState("Changed"); owned.Add(state); state.motion = baseClip;
+            var unchangedState = machine.AddState("Unchanged"); owned.Add(unchangedState); unchangedState.motion = unchanged;
+            var overrides = new AnimatorOverrideController(controller); owned.Add(overrides); overrides[baseClip] = swapClip;
+            var animator = root.AddComponent<Animator>(); animator.runtimeAnimatorController = overrides;
+            var context = (nadena.dev.ndmf.BuildContext)ctor.Invoke(new object[] { root, null, true });
+            var container = typeof(nadena.dev.ndmf.BuildContext).GetProperty("AssetContainer")?.GetValue(context) as UnityEngine.Object;
+            if (container != null) owned.Add(container);
+            var registry = typeof(nadena.dev.ndmf.BuildContext).GetProperty("ObjectRegistry").GetValue(context);
+            var scopeType = typeof(nadena.dev.ndmf.BuildContext).Assembly.GetType("nadena.dev.ndmf.ObjectRegistryScope");
+            using var registryScope = (IDisposable)Activator.CreateInstance(scopeType, registry);
+            var processor = new AvatarOptimizationProcessor(context, opt);
+            var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var copies = (Dictionary<Material, Material>)typeof(AvatarOptimizationProcessor).GetField("materialCopies", flags).GetValue(processor);
+            copies.Add(material, replacementMaterial);
+            typeof(AvatarOptimizationProcessor).GetMethod("ApplyStandaloneAdaptiveCompression", flags).Invoke(processor, null);
+            var output = (AnimatorOverrideController)animator.runtimeAnimatorController; owned.Add(output);
+            var outputBase = (UnityEditor.Animations.AnimatorController)output.runtimeAnimatorController; owned.Add(outputBase);
+            var outputMachine = outputBase.layers[0].stateMachine; owned.Add(outputMachine);
+            foreach (var child in outputMachine.states) owned.Add(child.state);
+            var outputBaseClip = (AnimationClip)outputMachine.states.First(s => s.state.name.StartsWith("Changed", StringComparison.Ordinal)).state.motion;
+            var outputClip = output[outputBaseClip]; owned.Add(outputBaseClip); owned.Add(outputClip);
+            Check(output != overrides && outputBase != controller && outputBaseClip != baseClip && outputClip != swapClip,
+                "adaptive compression copies and reattaches override, base controller and affected clips", results);
+            foreach (var pair in new[] { (source: baseClip, copy: outputBaseClip), (source: swapClip, copy: outputClip) })
+            {
+                Check(bindings.All(b => AnimationUtility.GetObjectReferenceCurve(pair.copy, b)[0].value == replacementMaterial),
+                    "adaptive compression rewrites every material slot: " + pair.source.name, results);
+                Check(ReferenceEquals(nadena.dev.ndmf.ObjectRegistry.GetReference(pair.source), nadena.dev.ndmf.ObjectRegistry.GetReference(pair.copy)),
+                    "compression clip retains NDMF replacement identity: " + pair.source.name, results);
+                Check(bindings.All(b => AnimationUtility.GetObjectReferenceCurve(pair.source, b)[0].value == material),
+                    "compression leaves source material keys intact: " + pair.source.name, results);
+            }
+            Check(outputMachine.states.First(s => s.state.name.StartsWith("Unchanged", StringComparison.Ordinal)).state.motion == unchanged &&
+                overrides.runtimeAnimatorController == controller && overrides[baseClip] == swapClip && state.motion == baseClip,
+                "compression preserves unchanged clips and source controller graph", results);
+        }
+
+        private static void RunMergeRegressionChecks(List<string> results, List<UnityEngine.Object> owned)
+        {
+            var root = new GameObject("Merge regression"); root.SetActive(false); owned.Add(root);
+            var opt = root.AddComponent<AvatarOptimizer>(); opt.meshSettings.mergeToggleObjects = true;
+            opt.meshSettings.preserveBlendshapesWhenCombining = true;
+            var material = new Material(Shader.Find("lilToon") ?? Shader.Find("Unlit/Color")); owned.Add(material);
+            material.SetOverrideTag("RenderType", "TransparentCutout"); material.renderQueue = 2450;
+            var property = material.HasProperty("_MainTexHSVG") ? "_MainTexHSVG" : "_Color";
+            var propertyBinding = "material." + property + (property == "_Color" ? ".r" : ".x");
+            var alternate = new Material(material); owned.Add(alternate);
+            var bones = Enumerable.Range(0, 5).Select(i => { var b = new GameObject("bone" + i); b.transform.SetParent(root.transform, false); return b.transform; }).ToArray();
+            var renderers = new List<SkinnedMeshRenderer>();
+            foreach (var name in new[] { "A", "B" })
+            {
+                var go = new GameObject(name); go.transform.SetParent(root.transform, false);
+                var renderer = go.AddComponent<SkinnedMeshRenderer>(); renderers.Add(renderer);
+                var mesh = new Mesh { name = name, vertices = new[] { Vector3.zero, Vector3.right, Vector3.up, Vector3.one },
+                    normals = Enumerable.Repeat(Vector3.forward, 4).ToArray(), tangents = Enumerable.Repeat(new Vector4(1,0,0,-1),4).ToArray(),
+                    colors = Enumerable.Repeat(Color.red,4).ToArray(), uv = new[] { Vector2.zero, Vector2.right, Vector2.up, Vector2.one },
+                    bindposes = Enumerable.Repeat(Matrix4x4.identity, 5).ToArray(), subMeshCount = 2 };
+                owned.Add(mesh); mesh.SetTriangles(new[] {0,1,2},0); mesh.SetTriangles(new[] {1,3,2},1);
+                mesh.SetUVs(1, Enumerable.Repeat(new Vector4(.1f,.2f,.3f,.4f),4).ToList());
+                GuardedAvatarPasses.WriteWeights(mesh, Enumerable.Range(0,4).Select(_ => Enumerable.Range(0,5)
+                    .Select(i => new BoneWeight1 { boneIndex = i, weight = .2f }).ToList()).ToList());
+                var dp = Enumerable.Repeat(Vector3.forward * .01f,4).ToArray();
+                mesh.AddBlendShapeFrame("Expression",50,dp,dp,dp); mesh.AddBlendShapeFrame("Expression",100,dp.Select(v=>v*2).ToArray(),dp,dp);
+                renderer.sharedMesh = mesh; renderer.bones = bones; renderer.sharedMaterials = new[] { material, material };
+                renderer.SetBlendShapeWeight(0, name == "A" ? 25 : 75);
+            }
+            var baseClip = new AnimationClip { name = "Base slots" }; var swapClip = new AnimationClip { name = "Override slots" };
+            owned.Add(baseClip); owned.Add(swapClip);
+            foreach (var clip in new[] { baseClip, swapClip })
+            {
+                foreach (var path in new[] { "A", "B" })
+                {
+                    var slot = path == "A" ? 0 : 1;
+                    AnimationUtility.SetObjectReferenceCurve(clip, EditorCurveBinding.PPtrCurve(path, typeof(SkinnedMeshRenderer), "m_Materials.Array.data[" + slot + "]"),
+                        new[] { new ObjectReferenceKeyframe { time = 0, value = material }, new ObjectReferenceKeyframe { time = 1, value = alternate } });
+                    AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve(path, typeof(SkinnedMeshRenderer), propertyBinding), AnimationCurve.Linear(0,0,1,1));
+                    AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve(path, typeof(GameObject), "m_IsActive"),
+                        AnimationCurve.Constant(0,1,path == "A" ? 1 : 0));
+                    AnimationUtility.SetEditorCurve(clip, EditorCurveBinding.FloatCurve(path, typeof(SkinnedMeshRenderer), "blendShape.Expression"),
+                        AnimationCurve.Constant(0,1,path == "A" ? 25 : 75));
+                }
+            }
+            var controller = new UnityEditor.Animations.AnimatorController { name = "Merge base" }; owned.Add(controller);
+            controller.AddLayer("Base"); var machine = controller.layers[0].stateMachine; owned.Add(machine);
+            var state = machine.AddState("State"); owned.Add(state); state.motion = baseClip;
+            var mask = new AvatarMask { name = "Merge mask", transformCount = 3 }; owned.Add(mask);
+            mask.SetTransformPath(0, ""); mask.SetTransformActive(0, true);
+            mask.SetTransformPath(1, "A"); mask.SetTransformActive(1, true);
+            mask.SetTransformPath(2, "B"); mask.SetTransformActive(2, true);
+            var layers = controller.layers; layers[0].avatarMask = mask; controller.layers = layers;
+            var overrides = new AnimatorOverrideController(controller); owned.Add(overrides); overrides[baseClip] = swapClip;
+            var avatarType = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("ABI.CCK.Components.CVRAvatar")).FirstOrDefault(t => t != null);
+            Component avatar = null;
+            if (avatarType != null) { avatar = root.AddComponent(avatarType); avatarType.GetField("overrides").SetValue(avatar, overrides); }
+            else root.AddComponent<Animator>().runtimeAnimatorController = overrides;
+            var settingsField = avatar != null ? avatarType.GetField("avatarSettings") : null;
+            var authoringSettings = settingsField != null ? Activator.CreateInstance(settingsField.FieldType) : null;
+            if (settingsField != null) settingsField.SetValue(avatar, authoringSettings);
+            var authoringBase = authoringSettings?.GetType().GetField("baseController");
+            if (authoringBase != null) authoringBase.SetValue(authoringSettings, controller);
+            var authoringOverride = authoringSettings?.GetType().GetField("baseOverrideController");
+            if (authoringOverride != null) authoringOverride.SetValue(authoringSettings, overrides);
+            Check(GuardedAvatarPasses.RendererMergeRejection(opt, renderers[0]) == null, "cutout, animated slots, multiple submeshes and five influences are merge eligible", results);
+            var overlayObject = new GameObject("Overlay"); overlayObject.transform.SetParent(renderers[1].transform, false);
+            var overlay = overlayObject.AddComponent<SkinnedMeshRenderer>(); overlay.sharedMesh = renderers[1].sharedMesh; overlay.bones = bones;
+            var transparent = new Material(material); owned.Add(transparent); transparent.SetOverrideTag("RenderType", "Transparent"); transparent.renderQueue = 3000;
+            overlay.sharedMaterials = new[] { transparent, transparent };
+            Check(GuardedAvatarPasses.CanPrepareToggle(opt, renderers[1].transform), "transparent child does not block eligible parent toggle", results);
+            Check(GuardedAvatarPasses.MaterialAnimationMergeRejection(opt, renderers[0], renderers[1]) == null, "matching shader-property curves are merge compatible", results);
+            var differing = EditorCurveBinding.FloatCurve("B", typeof(SkinnedMeshRenderer), propertyBinding);
+            AnimationUtility.SetEditorCurve(swapClip, differing, AnimationCurve.Linear(0,0,1,.5f));
+            Check(GuardedAvatarPasses.MaterialAnimationMergeRejection(opt, renderers[0], renderers[1]) != null, "different shader-property curves cannot overwrite one another", results);
+            AnimationUtility.SetEditorCurve(swapClip, differing, null);
+            Check(GuardedAvatarPasses.MaterialAnimationMergeRejection(opt, renderers[0], renderers[1]) != null, "missing shader-property curve remains independent", results);
+            AnimationUtility.SetEditorCurve(swapClip, differing, AnimationCurve.Linear(0,0,1,1));
+            Check(GuardedAvatarPasses.CanPrepareToggle(opt, renderers[0].transform), "Merge Toggle Objects alone authorizes conversion with zero optional limits", results);
+            var built = GuardedAvatarPasses.BuildMergedMesh(opt, renderers, out var mergedBones, out var mergedMaterials, out var slots, out var shapes); owned.Add(built);
+            Check(built.vertexCount == 8 && built.triangles.Length == 12 && built.subMeshCount == 3,
+                "shared submesh vertices copied once; only static identical slots collapse", results);
+            Check(slots[renderers[0]][0] != slots[renderers[1]][1] && mergedMaterials.Length == 3,
+                "independent animated slots retain separate destinations", results);
+            Check(GuardedAvatarPasses.ReadWeights(built).All(w => w.Count == 5 && Mathf.Abs(w.Sum(v=>v.weight)-1) < .0001f) && mergedBones.Length == 10,
+                "variable-length weights and all bind poses preserved", results);
+            var shape = built.GetBlendShapeIndex(shapes[renderers[1]]["Expression"]);
+            var positions = new Vector3[8]; var normals = new Vector3[8]; var tangents = new Vector3[8];
+            built.GetBlendShapeFrameVertices(shape,1,positions,normals,tangents);
+            Check(built.blendShapeCount == 2 && built.GetBlendShapeFrameCount(shape) == 2 && positions[0] == Vector3.zero && positions[4] == Vector3.forward * .02f && normals[4] == Vector3.forward * .01f && tangents[4] == normals[4],
+                "same-name shapes remain independent with every frame, normal and tangent delta", results);
+            Check(built.GetVertexAttributeDimension(UnityEngine.Rendering.VertexAttribute.TexCoord1) == 4 && built.colors.Length == 8 && built.tangents[7].w == -1,
+                "UV dimensions, colors and tangent handedness preserved", results);
+            alternate.SetOverrideTag("RenderType", "Transparent"); alternate.renderQueue = 3000;
+            Check(GuardedAvatarPasses.RendererMergeRejection(opt, renderers[0]) != null, "transparent material reached only by swap is rejected", results);
+            alternate.SetOverrideTag("RenderType", "TransparentCutout"); alternate.renderQueue = 2450;
+            var ctor = typeof(nadena.dev.ndmf.BuildContext).GetConstructor(new[] { typeof(GameObject), typeof(string), typeof(bool) });
+            if (ctor == null) { results.Add("SKIP: full NDMF merge execution requires real BuildContext"); return; }
+            var context = (nadena.dev.ndmf.BuildContext)ctor.Invoke(new object[] { root, null, true });
+            var container = typeof(nadena.dev.ndmf.BuildContext).GetProperty("AssetContainer")?.GetValue(context) as UnityEngine.Object;
+            if (container != null) owned.Add(container);
+            var registry = typeof(nadena.dev.ndmf.BuildContext).GetProperty("ObjectRegistry").GetValue(context);
+            var scopeType = typeof(nadena.dev.ndmf.BuildContext).Assembly.GetType("nadena.dev.ndmf.ObjectRegistryScope");
+            using var registryScope = (IDisposable)Activator.CreateInstance(scopeType, registry);
+            var oldMeshA = renderers[0].sharedMesh; var oldMeshB = renderers[1].sharedMesh;
+            renderers[1].gameObject.SetActive(false);
+            var processor = new AvatarOptimizationProcessor(context, opt);
+            processor.PrepareTogglePreservingMerge();
+            foreach (var r in renderers) owned.Add(r.sharedMesh);
+            // A fresh processor recognizes toggle meshes already prepared on the build clone.
+            processor = new AvatarOptimizationProcessor(context, opt);
+            typeof(AvatarOptimizationProcessor).GetMethod("CombineMeshes", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).Invoke(processor, null);
+            var survivor = root.GetComponentsInChildren<SkinnedMeshRenderer>(true).Where(r => r != overlay).ToArray();
+            Check(survivor.Length == 1 && survivor[0].sharedMesh.vertexCount == 8, "NDMF processor handoff produces one renderer with no submesh vertex duplication", results);
+            owned.Add(survivor[0].sharedMesh);
+            var output = (AnimatorOverrideController)(avatar != null ? avatarType.GetField("overrides").GetValue(avatar) : root.GetComponent<Animator>().runtimeAnimatorController);
+            var outputBase = (UnityEditor.Animations.AnimatorController)output.runtimeAnimatorController;
+            var outputMask = outputBase.layers[0].avatarMask; owned.Add(outputMask);
+            var mergedPath = AnimationUtility.CalculateTransformPath(survivor[0].transform, root.transform);
+            Check(outputMask != mask && Enumerable.Range(0, outputMask.transformCount).Any(i => outputMask.GetTransformPath(i) == mergedPath && outputMask.GetTransformActive(i)) && mask.transformCount == 3,
+                "copied AvatarMask explicitly covers the new renderer without changing source mask", results);
+            var outputBaseClip = (AnimationClip)outputBase.layers[0].stateMachine.states[0].state.motion;
+            var outputClip = output[outputBaseClip];
+            owned.Add(output); owned.Add(outputBase); owned.Add(outputBaseClip); owned.Add(outputClip); owned.Add(outputBase.layers[0].stateMachine); owned.Add(outputBase.layers[0].stateMachine.states[0].state);
+            if (authoringBase != null) Check(ReferenceEquals(authoringBase.GetValue(authoringSettings), controller),
+                "CCK authoring baseController remains the original asset reference", results);
+            if (authoringOverride != null) Check(ReferenceEquals(authoringOverride.GetValue(authoringSettings), overrides),
+                "CCK authoring baseOverrideController remains the original asset reference", results);
+            Check(output != overrides && outputBase != controller && outputBaseClip != baseClip && outputClip != swapClip,
+                "CVR override, underlying controller, base clip and override clip all copied and reattached", results);
+            foreach (var clip in new[] { outputBaseClip, outputClip })
+            {
+                var bindings = AnimationUtility.GetObjectReferenceCurveBindings(clip);
+                Check(bindings.Length == 2 && bindings.All(b => b.path == AnimationUtility.CalculateTransformPath(survivor[0].transform, root.transform)) && bindings.Select(b=>b.propertyName).Distinct().Count() == 2 &&
+                    bindings.All(b => AnimationUtility.GetObjectReferenceCurve(clip,b)[1].value == alternate),
+                    "copied clip remaps independent material swaps without overwriting: " + clip.name, results);
+            }
+            var outputPath = AnimationUtility.CalculateTransformPath(survivor[0].transform, root.transform);
+            var animatedProperties = AnimationUtility.GetCurveBindings(outputClip).Where(b => b.propertyName == propertyBinding).ToArray();
+            Check(animatedProperties.Length == 1 && animatedProperties[0].path == outputPath &&
+                Mathf.Abs(AnimationUtility.GetEditorCurve(outputClip, animatedProperties[0]).Evaluate(.5f) - .5f) < .001f,
+                "matching shader-property curves collapse to one equivalent output curve", results);
+            var retainedToggle = AnimationUtility.GetEditorCurve(outputClip, EditorCurveBinding.FloatCurve("B",typeof(GameObject),"m_IsActive"));
+            Check(retainedToggle != null && retainedToggle.Evaluate(0) == 0 && !overlayObject.transform.parent.gameObject.activeSelf && survivor[0].gameObject.activeSelf,
+                "source toggle and transparent overlay remain off while sibling merged renderer stays active", results);
+            Check(overrides.runtimeAnimatorController == controller && state.motion == baseClip && overrides[baseClip] == swapClip &&
+                AnimationUtility.GetObjectReferenceCurveBindings(swapClip).Any(b=>b.path == "B") && oldMeshA.vertexCount == 4 && oldMeshB.vertexCount == 4,
+                "original override, controller, clip bindings and mesh assets unchanged", results);
+            var mergedMesh = survivor[0].sharedMesh;
+            Check(Enumerable.Range(0,mergedMesh.blendShapeCount).Any(i=>mergedMesh.GetBlendShapeName(i).StartsWith("MT_Hide_B") && survivor[0].GetBlendShapeWeight(i) == 100),
+                "initially inactive toggle retains hidden state after merging", results);
+        }
+
+        [MenuItem("Tools/Avatar Optimizer/Test Rumoka merge on temporary clone")]
+        public static void RunRumokaMergeSmokeTest()
+        {
+            var source = FindBenchmarkAvatar();
+            var rows = new List<string> { "Merge-only test on a temporary scene clone; no scene or asset saved.", "Source: " + source.name };
+            var existing = new HashSet<int>(Resources.FindObjectsOfTypeAll<UnityEngine.Object>().Select(o => o.GetInstanceID()));
+            var staging = new GameObject("Merge validation staging"); staging.SetActive(false);
+            try
+            {
+                var clone = UnityEngine.Object.Instantiate(source, staging.transform);
+                var opt = clone.GetComponent<AvatarOptimizer>() ?? clone.AddComponent<AvatarOptimizer>();
+                opt.reportOnly = false; opt.meshSettings.mergeToggleObjects = true; opt.meshSettings.combineMeshes = true;
+                int before = clone.GetComponentsInChildren<SkinnedMeshRenderer>(true).Length;
+                var ctor = typeof(nadena.dev.ndmf.BuildContext).GetConstructor(new[] { typeof(GameObject), typeof(string), typeof(bool) });
+                var context = (nadena.dev.ndmf.BuildContext)ctor.Invoke(new object[] { clone, null, true });
+                var registry = typeof(nadena.dev.ndmf.BuildContext).GetProperty("ObjectRegistry").GetValue(context);
+                using var registryScope = (IDisposable)Activator.CreateInstance(typeof(nadena.dev.ndmf.BuildContext).Assembly.GetType("nadena.dev.ndmf.ObjectRegistryScope"), registry);
+                var processor = new AvatarOptimizationProcessor(context, opt);
+                processor.PrepareTogglePreservingMerge();
+                processor = new AvatarOptimizationProcessor(context, opt);
+                typeof(AvatarOptimizationProcessor).GetMethod("CombineMeshes", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).Invoke(processor, null);
+                processor.FlushBufferedLog();
+                int after = clone.GetComponentsInChildren<SkinnedMeshRenderer>(true).Length;
+                rows.Add("Renderers: " + before + " -> " + after);
+                foreach (var renderer in clone.GetComponentsInChildren<SkinnedMeshRenderer>(true).Where(r => r.name.Contains("_Combined")))
+                    rows.Add(renderer.name + ": " + renderer.sharedMesh.vertexCount + " vertices, " + renderer.sharedMesh.subMeshCount + " slots");
+                Check(after < before, "representative avatar produces a real merge", rows);
+            }
+            catch (Exception ex) { rows.Add("FAIL: " + ex); throw; }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(staging);
+                foreach (var asset in Resources.FindObjectsOfTypeAll<UnityEngine.Object>().Where(o => !existing.Contains(o.GetInstanceID()) && !EditorUtility.IsPersistent(o) &&
+                    (o is Mesh || o is AnimationClip || o is RuntimeAnimatorController || o is UnityEditor.Animations.AnimatorState ||
+                     o is UnityEditor.Animations.AnimatorStateMachine || o is UnityEditor.Animations.AnimatorTransitionBase || o is UnityEditor.Animations.BlendTree || o is AvatarMask)).ToArray())
+                    UnityEngine.Object.DestroyImmediate(asset);
+                WriteReport("rumoka-merge-smoke.txt", rows);
+            }
+        }
+
+        private static void Check(bool condition, string name, List<string> results)
+        {
+            if (!condition) throw new InvalidOperationException(name);
+            results.Add("PASS: " + name);
+        }
+
+        [MenuItem("Tools/Avatar Optimizer/Inventory Rumoka benchmark prefab")]
+        public static void InventoryRumoka()
+        {
+            var asset = FindBenchmarkAvatar();
+            var staging = new GameObject("Optimizer benchmark staging"); staging.SetActive(false);
+            var rows = new List<string> { "Read-only avatar inventory; no scene or asset saved.", "Unity: " + Application.unityVersion,
+                "Source: " + asset.scene.path + " / " + asset.name + " / " + AssetDatabase.GetAssetPath(asset) };
+            try
+            {
+                var clone = UnityEngine.Object.Instantiate(asset, staging.transform);
+                var opt = clone.GetComponent<AvatarOptimizer>() ?? clone.AddComponent<AvatarOptimizer>();
+                var renderers = clone.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+                rows.Add("Skinned renderers: " + renderers.Length);
+                rows.Add("Vertices: " + renderers.Where(r => r.sharedMesh != null).Sum(r => (long)r.sharedMesh.vertexCount));
+                rows.Add("Reachable clips: " + GuardedAvatarPasses.Clips(opt).Select(u => u.clip).Distinct().Count());
+                foreach (var renderer in renderers.Where(r => r.sharedMesh != null))
+                {
+                    var mesh = renderer.sharedMesh;
+                    rows.Add(AnimationUtility.CalculateTransformPath(renderer.transform, clone.transform) +
+                        " | vertices=" + mesh.vertexCount + " | shapes=" + mesh.blendShapeCount + " | bones=" + renderer.bones.Length +
+                        " | simplification=" + (GuardedAvatarPasses.GeometryExclusion(opt, renderer) ?? "eligible for pose validation") +
+                        " | merge=" + (GuardedAvatarPasses.RendererMergeRejection(opt, renderer) ?? "eligible for grouping"));
+                }
+                rows.Add(GuardedAvatarPasses.DescribeMergePlan(opt));
+            }
+            finally { UnityEngine.Object.DestroyImmediate(staging); WriteReport("rumoka-prefab-inventory.txt", rows); }
+        }
+
+        private static void WriteReport(string name, IEnumerable<string> lines)
+        {
+            string directory = System.IO.Path.Combine(Application.dataPath, "../Library/AvatarOptimizerValidation");
+            System.IO.Directory.CreateDirectory(directory);
+            string path = System.IO.Path.GetFullPath(System.IO.Path.Combine(directory, name));
+            System.IO.File.WriteAllLines(path, lines);
+            Debug.Log("[AvatarOptimizer] Validation report: " + path + "\n" + string.Join("\n", lines));
+        }
+
+        [Serializable]
+        private sealed class GeometrySample
+        {
+            public string name;
+            public Vector3[] vertices;
+            public int[] indices;
+        }
+
+        // Development comparison only. Candidates are measured and destroyed, never assigned.
+        // An optional externally loaded Meshia assembly participates without a package dependency.
+        [MenuItem("Tools/Avatar Optimizer/Compare Rumoka simplification candidates")]
+        public static void CompareRumokaBackends()
+        {
+            var asset = FindBenchmarkAvatar();
+            var rows = new List<string> { "Candidate comparison only; no avatar changes. One cold run per mesh; timings are not a backend ranking.",
+                "Target: 75% triangles; border preservation enabled; smart linking disabled where supported.",
+                "Corpus: three quantiles of unique readable meshes <= 30000 vertices and <= 64 shapes; larger meshes excluded from this pilot.",
+                "Source: " + asset.scene.path + " / " + asset.name + " / " + AssetDatabase.GetAssetPath(asset) };
+            var meshes = asset.GetComponentsInChildren<SkinnedMeshRenderer>(true).Select(r => r.sharedMesh)
+                .Where(m => m != null && m.isReadable && m.vertexCount > 0 && m.vertexCount <= 30000 && m.blendShapeCount <= 64)
+                .Distinct().OrderBy(m => m.vertexCount).ToArray();
+            string directory = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, "../Library/AvatarOptimizerValidation"));
+            System.IO.Directory.CreateDirectory(directory);
+            if (meshes.Length == 0) { rows.Add("No eligible pilot meshes."); WriteReport("rumoka-backend-comparison.txt", rows); return; }
+            var corpus = new[] { meshes[0], meshes[meshes.Length / 2], meshes[meshes.Length - 1] }.Distinct().ToArray();
+            foreach (var mesh in corpus)
+            {
+                string id = Array.IndexOf(corpus, mesh).ToString();
+                System.IO.File.WriteAllText(System.IO.Path.Combine(directory, "corpus-" + id + ".json"),
+                    JsonUtility.ToJson(new GeometrySample { name = mesh.name, vertices = mesh.vertices, indices = mesh.triangles }));
+                rows.Add("CORPUS " + id + ": " + mesh.name + "; vertices=" + mesh.vertexCount + "; triangles=" + mesh.triangles.Length / 3 + "; shapes=" + mesh.blendShapeCount);
+                foreach (string typeName in new[] { "MilchZocker.SimplificationPrototype.MeshSimplifier", "Meshia.MeshSimplification.MeshSimplifier" })
+                {
+                    Mesh result = null;
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    try
+                    {
+                        var type = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType(typeName)).FirstOrDefault(t => t != null);
+                        if (type == null) throw new InvalidOperationException("backend assembly not loaded");
+                        if (typeName.StartsWith("MilchZocker", StringComparison.Ordinal))
+                        {
+                            if (GuardedAvatarPasses.HasManyWeights(mesh)) throw new InvalidOperationException("more than four influences: incompatible input");
+                            var instance = Activator.CreateInstance(type);
+                            var property = type.GetProperty("SimplificationOptions");
+                            var options = property.GetValue(instance);
+                            foreach (var field in new[] { "PreserveBorderEdges", "PreserveUVSeamEdges", "PreserveUVFoldoverEdges", "PreserveSurfaceCurvature" })
+                                options.GetType().GetField(field)?.SetValue(options, true);
+                            options.GetType().GetField("EnableSmartLink")?.SetValue(options, false);
+                            property.SetValue(instance, options);
+                            type.GetMethod("Initialize", new[] { typeof(Mesh) }).Invoke(instance, new object[] { mesh });
+                            type.GetMethod("SimplifyMesh", new[] { typeof(float) }).Invoke(instance, new object[] { 0.75f });
+                            result = (Mesh)type.GetMethod("ToMesh").Invoke(instance, null);
+                        }
+                        else
+                        {
+                            var targetType = type.Assembly.GetType("Meshia.MeshSimplification.MeshSimplificationTarget");
+                            var target = Activator.CreateInstance(targetType);
+                            targetType.GetField("Kind").SetValue(target, Enum.Parse(targetType.GetField("Kind").FieldType, "RelativeTriangleCount"));
+                            targetType.GetField("Value").SetValue(target, 0.75f);
+                            var optionsType = type.Assembly.GetType("Meshia.MeshSimplification.MeshSimplifierOptions");
+                            var options = optionsType.GetProperty("Default").GetValue(null);
+                            optionsType.GetField("PreserveBorderEdges").SetValue(options, true);
+                            optionsType.GetField("PreserveSurfaceCurvature").SetValue(options, true);
+                            optionsType.GetField("EnableSmartLink").SetValue(options, false);
+                            result = new Mesh();
+                            type.GetMethods().Single(m => m.Name == "Simplify" && m.GetParameters().Length == 4)
+                                .Invoke(null, new[] { (object)mesh, target, options, result });
+                        }
+                        timer.Stop();
+                        rows.Add(typeName + ": " + result.vertexCount + " vertices, " + result.triangles.Length / 3 + " triangles, " + timer.ElapsedMilliseconds +
+                            " ms, stream-layout=" + GuardedAvatarPasses.StreamsCompatible(mesh, result) + "; pose acceptance NOT established by this microbenchmark.");
+                    }
+                    catch (Exception ex) { rows.Add(typeName + ": unavailable/rejected: " + ex.GetBaseException().Message); }
+                    finally { if (result != null) UnityEngine.Object.DestroyImmediate(result); }
+                    WriteReport("rumoka-backend-comparison.txt", rows);
+                }
+            }
+        }
+
+        private static GameObject FindBenchmarkAvatar()
+        {
+            var avatars = new List<GameObject>();
+            for (int sceneIndex = 0; sceneIndex < UnityEngine.SceneManagement.SceneManager.sceneCount; sceneIndex++)
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(sceneIndex);
+                if (!scene.isLoaded || UnityEditor.SceneManagement.EditorSceneManager.IsPreviewScene(scene)) continue;
+                foreach (var root in scene.GetRootGameObjects())
+                    avatars.AddRange(root.GetComponentsInChildren<Component>(true)
+                        .Where(c => c != null && c.GetType().FullName == "ABI.CCK.Components.CVRAvatar").Select(c => c.gameObject));
+            }
+            var selected = avatars.Distinct().OrderByDescending(a => a.GetComponentsInChildren<SkinnedMeshRenderer>(true).Length).FirstOrDefault();
+            if (selected == null) throw new InvalidOperationException("No CVR avatar is loaded. Open the representative avatar scene before benchmarking.");
+            return selected;
+        }
     }
 }
 

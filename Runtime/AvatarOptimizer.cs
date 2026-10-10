@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Serialization;
@@ -15,6 +15,11 @@ namespace MilchZocker.AvatarOptimizer
         [Header("=== Mesh Optimisation ===")]
         [Space(5)]
         public MeshOptimizationSettings meshSettings = new MeshOptimizationSettings();
+        public MergeBudgetSettings mergeBudgetSettings = new MergeBudgetSettings();
+
+        [Header("=== Simplification ===")]
+        public SimplificationSettings simplificationSettings = new SimplificationSettings();
+        public RigReductionSettings rigReductionSettings = new RigReductionSettings();
         
         [Header("=== Blendshape Optimisation ===")]
         [Space(5)]
@@ -23,6 +28,7 @@ namespace MilchZocker.AvatarOptimizer
         [Header("=== Texture Atlas Generation ===")]
         [Space(5)]
         public AtlasGenerationSettings atlasSettings = new AtlasGenerationSettings();
+        public SurfaceOptimizationSettings surfaceSettings = new SurfaceOptimizationSettings();
 
         [Header("=== Optimization Analysis ===")]
         [Space(5)]
@@ -222,6 +228,88 @@ namespace MilchZocker.AvatarOptimizer
         }
         
         [Serializable]
+        public class MergeBudgetSettings
+        {
+            [HideInInspector] // Legacy serialized setting; Merge Toggle Objects now controls visibility conversion.
+            public bool allowIndependentVisibility = false;
+            [Tooltip("Optional added blendshape memory limit in MB. Zero means no limit.")]
+            [Min(0)] public float maximumAddedMorphMemoryMB = 0;
+            [Tooltip("Optional limit on vertices submitted by a merged toggle group. Zero means no limit.")]
+            [Min(0)] public int maximumHiddenVertices = 0;
+            [Min(1)] public float maximumBoundsVolumeRatio = 2;
+            public bool showMergePlan = true;
+        }
+
+        [Serializable]
+        public class SurfaceOptimizationSettings
+        {
+            [Tooltip("Crop and pack connected UV0 islands using a verified shader texture mapping. Includes a basic lilToon mapping; custom shaders can provide profiles below.")]
+            public bool packUvIslands = false;
+            [Tooltip("Use the same layout for all alternatives of one material-swap slot per renderer. Multiple independent slots are rejected.")]
+            public bool atlasMaterialSwaps = false;
+            [Tooltip("Clear texture references only when a verified shader dependency rule proves the feature disabled in every material state.")]
+            public bool removeUnusedTextures = false;
+            [Tooltip("Verified mappings for custom shaders. List every assigned texture as UV0-dependent or independent of UV0; do not infer sampling from texture names.")]
+            public SurfaceShaderProfile[] shaderProfiles = Array.Empty<SurfaceShaderProfile>();
+            [Range(256, 8192)] public int maximumAtlasSize = 2048;
+            [Range(2, 64)] public int mipPadding = 8;
+            [Range(1, 32)] public int maximumSwapVariants = 8;
+        }
+
+        [Serializable]
+        public class SurfaceShaderProfile
+        {
+            public Shader shader;
+            [Tooltip("Comma-separated texture properties sampled with mesh UV0. All are repacked together. The profile assumes no procedural/animated UV transformations.")]
+            public string uv0Textures = "";
+            [Tooltip("Comma-separated texture properties whose sampling is independent of UV0, such as verified matcap or cubemap inputs. These are kept unchanged.")]
+            public string independentTextures = "";
+            [Tooltip("Source-verified feature gates. An unlisted texture reference is never removed automatically.")]
+            public DisabledTextureRule[] disabledTextureRules = Array.Empty<DisabledTextureRule>();
+        }
+
+        [Serializable]
+        public class DisabledTextureRule
+        {
+            public string textureProperty;
+            public string featureProperty;
+            public float disabledValue = 0;
+        }
+
+        [Serializable]
+        public class SimplificationSettings
+        {
+            public bool enabled = false;
+            [Tooltip("Simplification backend. Meshia requires its optional runtime plus Unity 2022.3, Burst 1.8.21, Collections 2.5.7 and Mathematics 1.3.2 or newer.")]
+            public string backend = "UnityMeshSimplifier";
+            [Range(0.05f, 1)] public float targetTriangleRatio = 0.75f;
+            [Min(0.00001f)] public float maximumPositionError = 0.001f;
+            [Range(0, 45)] public float maximumNormalErrorDegrees = 5;
+            [Min(0)] public float maximumUvError = 0.0001f;
+            [Min(0)] public float maximumColorError = 0.001f;
+            [Min(1)] public int poseValidationBudget = 64;
+            [Min(1000)] public int maximumValidationComparisons = 2000000;
+            public bool allowSkinnedMeshes = false;
+            [Tooltip("Required by the prototype. Disabling seam protection excludes simplification.")]
+            public bool preserveSeams = true;
+            public bool protectFaceAndHands = true;
+            [Tooltip("Renderers under these transforms are excluded from simplification and lossy rig reduction.")]
+            public Transform[] protectedRegions = Array.Empty<Transform>();
+            public AnimationClip[] validationClips = Array.Empty<AnimationClip>();
+        }
+
+        [Serializable]
+        public class RigReductionSettings
+        {
+            [Tooltip("Coalesce references to the exact same Transform with identical bind poses. Does not delete Transform objects.")]
+            public bool mergeEquivalentBoneReferences = false;
+            [Tooltip("Lossy reduction of variable-length bone weights; accepted only after pose validation.")]
+            public bool reduceInfluences = false;
+            [Range(1, 32)] public int maximumInfluences = 4;
+            [Min(0.00001f)] public float maximumPositionError = 0.0005f;
+        }
+
+        [Serializable]
         public class BoneOptimizationSettings
         {
             [Tooltip("Remove unused bone references from Skinned Mesh Renderers")]
@@ -298,6 +386,27 @@ namespace MilchZocker.AvatarOptimizer
 
             [Tooltip("Exclude the face mesh selected on the CVR Avatar component from mesh merging")]
             public bool excludeFaceMeshFromCombine = true;
+
+            [Space(8)]
+            [Header("Toggle-Preserving Mesh Merge")]
+            [Tooltip("Convert supported GameObject visibility toggles to hide blendshapes before mesh merging")]
+            public bool mergeToggleObjects = false;
+
+            [Tooltip("Exclude the CVR face mesh from toggle-preserving mesh merging")]
+            public bool excludeFaceMeshFromToggleMerge = true;
+
+            public ToggleMergeBackend toggleMergeBackend = ToggleMergeBackend.Automatic;
+
+            [Tooltip("Allow meshes containing blendshapes to be merged while preserving their blendshape bindings")]
+            public bool preserveBlendshapesWhenCombining = false;
+
+            public enum ToggleMergeBackend
+            {
+                InfinimationBlendshape = 0,
+                UVTileDiscard = 1,
+                NaNimation = 2,
+                Automatic = 3
+            }
             
             [Space(10)]
             [Tooltip("Recalculate normals after optimisation")]
@@ -367,6 +476,9 @@ namespace MilchZocker.AvatarOptimizer
         {
             [Tooltip("Remove unused blendshapes (keeps CVR system blendshapes)")]
             public bool removeUnusedBlendshapes = true;
+
+            [Tooltip("Bake unanimated, unreferenced single-frame nonzero shapes. Facial and user-preserved shapes are never baked. Multi-frame nonzero shapes are retained.")]
+            public bool bakeConstantBlendshapes = false;
             
             [Tooltip("Scan override animator controller for used blendshapes")]
             public bool scanOverrideController = true;
@@ -414,7 +526,7 @@ namespace MilchZocker.AvatarOptimizer
             
             [Space(10)]
             [Header("Animation Safety")]
-            [Tooltip("Exclude materials that are animated in controllers from atlasing")]
+            [Tooltip("Exclude materials that are animated in controllers from atlasing. Material-swap slots and their alternatives are always excluded to preserve UV layout.")]
             public bool excludeAnimatedMaterials = true;
             
             [Tooltip("Scan override animator controller for material animations")]
@@ -485,6 +597,12 @@ namespace MilchZocker.AvatarOptimizer
             [Header("═══════ Adaptive Compression Configuration ═══════")]
             [Tooltip("Enable adaptive compression based on texture complexity analysis")]
             public bool useAdaptiveCompression = true;
+
+            [Tooltip("Only replace a texture copy when the estimated result is smaller than the original")]
+            public bool onlyReduceFileSize = true;
+
+            [Tooltip("Automatically choose Point, Bilinear, or Trilinear filtering from texture complexity")]
+            public bool automaticFilterModes = true;
             
             [Tooltip("Log detailed complexity analysis for each texture")]
             public bool verboseDensityLogging = false;
