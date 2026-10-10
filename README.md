@@ -16,6 +16,10 @@ The optimizer works on a cloned bake result rather than directly rewriting your 
 ### Animation-aware safety
 The tool inspects the avatar's controllers, override controllers, advanced avatar settings, and related references to understand which bones, blendshapes, and material properties are actually in use. This is critical for CVR avatars, where facial systems, toggles, and physics-related rig elements can be easy to accidentally break.
 
+CVR animation rewrites start from the controller selected in `CVRAvatar.overrides`. When a clip needs adjustment, the optimizer copies the override controller and its base controller graph, then replaces clip references in the copies. Other assigned Animator controllers are handled independently; they do not replace the CVR override selection. Unassigned controllers elsewhere in the project are not scanned as a fallback.
+
+Material discovery includes materials referenced by animation swap keyframes, even when they are never assigned to a renderer initially. These alternatives contribute to the inspector's material/texture inventory and standalone adaptive compression; copied swap clips reference the processed material copies. Swap-driven materials are excluded from atlasing until a shared UV layout can be preserved across every alternative. Ordinary combining and submesh collapsing skip swap-driven renderers; toggle merging retains separate material slots and remaps their animation indices.
+
 ### Bone cleanup with protective checks
 The processor can remove unused bone references and identify bones that are no longer needed. Before doing anything destructive, it checks for common safety cases such as:
 - animated transforms
@@ -46,6 +50,16 @@ The package can generate texture atlases for compatible materials, group them by
 The tool records findings, warnings, and summary information and can run in report-only mode so you can review what it would change before allowing destructive operations. This is especially useful for the first bake of a new avatar or when you are tuning a complex rig.
 
 ---
+
+## Package layout
+
+The optimizer follows the same Editor/Plugin separation as NDMF-Merge:
+
+- `Editor/CVRAvatarOptimizerEditor.cs`: custom inspector and estimates.
+- `Editor/CVRAvatarOptimizerPlugin.cs`: NDMF registration, processing, atlas packing, and shared animation analysis, grouped into regions.
+- `Editor/dev.milchzocker.ndmf-avatar-optimisation.Editor.asmdef`: editor assembly and dependencies.
+
+The runtime component remains `Runtime/AvatarOptimizer.cs`, with its own runtime assembly definition, to preserve existing serialized avatar settings. Unity `.meta` files remain alongside the assets.
 
 ## 📦 Requirements
 
@@ -272,5 +286,7 @@ This pairing is especially effective when you want a build pipeline that is both
 ---
 
 ## 📄 License
+
+The new opt-in blendshape, merge-budget, surface-family, simplification, and rig-reduction options are described in [Guarded optimization implementation](docs/guarded-optimization-implementation.md), including their current exclusions and validation commands. Simplification remains a provisional backend experiment; automatic thresholds have not been selected from avatar benchmarks.
 
 This project is distributed under the MIT License. See the LICENSE file for details.
